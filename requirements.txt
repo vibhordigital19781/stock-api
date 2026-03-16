@@ -1,0 +1,96 @@
+# ── Python dependencies ──────────────────────────────────────────────────────
+fastapi==0.110.0
+uvicorn==0.29.0
+yfinance==0.2.38
+feedparser==6.0.11
+requests==2.31.0
+python-dotenv==1.0.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETUP & RUN INSTRUCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# STEP 1 — Install Python (if not installed)
+#   https://www.python.org/downloads/  (Python 3.10+)
+#
+# STEP 2 — Install dependencies
+#   pip install -r requirements.txt
+#
+# STEP 3 — Start the backend server
+#   python main.py
+#   OR
+#   uvicorn main:app --reload --port 8000
+#
+# STEP 4 — Test it's working
+#   Open browser → http://localhost:8000/api/all
+#   You should see live market JSON data
+#
+# STEP 5 — Connect to your React frontend
+#   In your React dashboard, replace the simulated INIT data with:
+#
+#   useEffect(() => {
+#     fetch("http://localhost:8000/api/all")
+#       .then(r => r.json())
+#       .then(data => setMarketData(data));
+#   }, []);
+#
+#   // Then poll every 60 seconds (yfinance rate limits)
+#   const interval = setInterval(() => {
+#     fetch("http://localhost:8000/api/all")
+#       .then(r => r.json())
+#       .then(data => setMarketData(data));
+#   }, 60000);
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# FREE HOSTING OPTIONS (to run 24/7 without your laptop)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  ┌─────────────────────┬────────────────────────────────────────┬──────────┐
+#  │ Platform            │ Free Tier                              │ Link     │
+#  ├─────────────────────┼────────────────────────────────────────┼──────────┤
+#  │ Railway.app         │ $5 free credits/month (~500 hrs)       │ Best     │
+#  │ Render.com          │ Free tier (spins down after 15 min)    │ OK       │
+#  │ Fly.io              │ 3 free VMs, always on                  │ Great    │
+#  │ PythonAnywhere      │ Free tier, always on, limited CPU      │ OK       │
+#  │ Google Cloud Run    │ 2M free requests/month                 │ Great    │
+#  └─────────────────────┴────────────────────────────────────────┴──────────┘
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA SOURCES USED (ALL FREE)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  yfinance      → Yahoo Finance (unofficial)
+#                  • No API key needed
+#                  • 15-20 min delay for Indian markets
+#                  • Real-time for US markets
+#                  • Rate limit: ~2000 req/hour
+#
+#  NSE India     → nseindia.com unofficial JSON endpoints
+#                  • No API key needed
+#                  • Near real-time (during market hours)
+#                  • May break if NSE changes their site
+#
+#  RSS Feeds     → ET Markets, Moneycontrol, Business Standard
+#                  • No API key needed
+#                  • Real-time news
+#                  • Always free
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# UPGRADE PATH — when you want to go commercial
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  Indian Markets (real-time):
+#    • Zerodha Kite Connect   → ₹2,000/month (best for India)
+#    • Angel One SmartAPI     → Free! (with demat account)
+#    • Upstox API             → Free (with account)
+#    • Dhan API               → Free (with account)
+#    NOTE: Angel One & Upstox APIs are FREE if you have their demat account!
+#
+#  Global Markets:
+#    • Alpha Vantage          → Free tier (25 req/day), $50/month for more
+#    • Polygon.io             → Free tier available
+#    • Marketstack            → 100 req/month free
+#
+#  News:
+#    • NewsAPI.org            → 100 req/day free, $449/month for production
+#    • Refinitiv/Reuters      → Enterprise (expensive)
