@@ -26,6 +26,9 @@ from functools import lru_cache
 import time
 
 app = FastAPI(title="Bazaar Watch API")
+@app.get("/debug")
+def debug():
+    return {"status": "Server alive", "cache": len(_cache)}
 
 # Allow your frontend to call this backend
 app.add_middleware(
