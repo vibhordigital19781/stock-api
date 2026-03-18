@@ -40,7 +40,7 @@ app.add_middleware(
 
 # ── Simple in-memory cache (avoids hammering free APIs) ───────────────────────
 _cache = {}
-CACHE_TTL = 60  # seconds — refresh every 60s (free APIs rate-limit heavily)
+CACHE_TTL = 30  # seconds — refresh every 60s (free APIs rate-limit heavily)
 
 def cache_get(key):
     if key in _cache:
@@ -427,7 +427,6 @@ def get_news():
 
 @app.get("/api/all")
 def get_all():
-    """Single endpoint — returns everything at once (reduces frontend requests)."""
     return {
         "indices":      get_indices(),
         "commodities":  get_commodities(),
@@ -435,6 +434,7 @@ def get_all():
         "worldMarkets": get_world_markets(),
         "news":         fetch_news(limit=15),
         "lastUpdated":  datetime.now().isoformat(),
+    }
     }
 
 # ── Run directly ──────────────────────────────────────────────────────────────
