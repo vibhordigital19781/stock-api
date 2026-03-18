@@ -91,10 +91,9 @@ MCX_CONVERT = {
 }
 
 def fetch_yf_price(symbol: str):
-    """Fetch latest price and % change from Yahoo Finance."""
     try:
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="2d", interval="1d")
+        hist = ticker.history(period="5d", interval="1d")
         if hist.empty or len(hist) < 1:
             return None, None
         latest = float(hist["Close"].iloc[-1])
