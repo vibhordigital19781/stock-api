@@ -1,46 +1,39 @@
 """
-BAZAAR WATCH — Free Data Backend
-=================================
-Uses only FREE data sources:
-  • yfinance         → Indices, commodities, forex, US markets (15-min delay)
-  • NSE India JSON   → Live Indian market data (unofficial, free)
-  • RSS feeds        → ET Markets, Moneycontrol, Business Standard news
+BAZAAR WATCH — Free Data Backend v2
+=====================================
+Uses only FREE data sources with no IP restrictions:
+  • Google Finance  → All market prices (works on any server)
+  • NSE India JSON  → Indian indices (near real-time)
+  • RSS feeds       → Live news (ET Markets, Moneycontrol etc.)
 
 Install:
-    pip install fastapi uvicorn yfinance feedparser requests python-dotenv
+    pip install fastapi uvicorn requests feedparser beautifulsoup4 python-dotenv
 
 Run:
-    uvicorn main:app --reload --port 8000
-
-Then open your frontend and point it to http://localhost:8000
+    uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
-import feedparser
 import requests
-import asyncio
-from datetime import datetime
-from functools import lru_cache
+import feedparser
 import time
+import re
+from datetime import datetime
 
-app = FastAPI(title="Bazaar Watch API")
-@app.get("/debug")
-def debug():
-    return {"status": "Server alive", "cache": len(_cache)}
+app = FastAPI(title="Bazaar Watch API v2")
 
-# Allow your frontend to call this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Simple in-memory cache (avoids hammering free APIs) ───────────────────────
+# ── Cache ─────────────────────────────────────────────────────────────────────
 _cache = {}
-CACHE_TTL = 30  # seconds — refresh every 60s (free APIs rate-limit heavily)
+CACHE_TTL = 60
 
 def cache_get(key):
     if key in _cache:
@@ -52,136 +45,167 @@ def cache_get(key):
 def cache_set(key, data):
     _cache[key] = (data, time.time())
 
-# ── Yahoo Finance symbols ─────────────────────────────────────────────────────
-YF_SYMBOLS = {
-    # Indian Indices
-    "nifty50":    "^NSEI",
-    "sensex":     "^BSESN",
-    "bankNifty":  "^NSEBANK",
-    "niftyIT":    "^CNXIT",
-    # Commodities (USD-denominated, we convert to INR below)
-    "gold":       "GC=F",
-    "silver":     "SI=F",
-    "crude":      "CL=F",
-    "copper":     "HG=F",
-    "aluminium":  "ALI=F",
-    "zinc":       "ZNC=F",
-    "nickel":     "^LMENIK",  # fallback to MCX scrape if this fails
-    # Forex
-    "usdinr":     "INR=X",
-    "dxy":        "DX-Y.NYB",
-    # US Markets
-    "dji":        "^DJI",
-    "sp500":      "^GSPC",
-    "dowFutures": "YM=F",
-    "bond10y":    "^TNX",
+# ── Headers ───────────────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
 }
 
-# MCX conversion multipliers (approximate, USD commodity → INR)
-# Gold: per troy oz → per 10g   |  Silver: per troy oz → per kg
-# Copper/Zinc etc: per lb → per kg
-MCX_CONVERT = {
-    "gold":      lambda usd, rate: round(usd * rate / 31.1035 * 10, 0),  # per 10g
-    "silver":    lambda usd, rate: round(usd * rate / 31.1035 * 1000, 0), # per kg
-    "crude":     lambda usd, rate: round(usd * rate, 0),                   # per bbl
-    "copper":    lambda usd, rate: round(usd * rate * 2.20462, 2),         # per kg
-    "aluminium": lambda usd, rate: round(usd * rate * 2.20462, 2),         # per kg
-    "zinc":      lambda usd, rate: round(usd * rate * 2.20462, 2),         # per kg
-    "nickel":    lambda usd, rate: round(usd * rate * 2.20462, 2),         # per kg
-}
-
-def fetch_yf_price(symbol: str):
+# ── Google Finance scraper ────────────────────────────────────────────────────
+def fetch_google_finance(ticker: str, exchange: str = ""):
+    """
+    Fetch price from Google Finance.
+    Examples:
+      fetch_google_finance("NSEI", "INDEXNSE")
+      fetch_google_finance("DJI", "INDEXDJX")
+      fetch_google_finance("INR", "CURRENCY")
+    """
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="5d", interval="1d")
-        if hist.empty or len(hist) < 1:
-            return None, None
-        latest = float(hist["Close"].iloc[-1])
-        prev   = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else latest
-        ch     = round((latest - prev) / prev * 100, 2)
-        return latest, ch
-    except Exception as e:
-        print(f"yfinance error for {symbol}: {e}")
+        if exchange:
+            url = f"https://www.google.com/finance/quote/{ticker}:{exchange}"
+        else:
+            url = f"https://www.google.com/finance/quote/{ticker}"
+
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        html = r.text
+
+        # Extract price using regex patterns
+        # Google Finance shows price in a specific div
+        price_patterns = [
+            r'"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)"[^>]*data-last-price',
+            r'data-last-price="([^"]+)"',
+            r'class="YMlKec fxKbKc"[^>]*>([^<]+)<',
+            r'class="kf1m0"[^>]*>\s*([0-9,\.]+)',
+        ]
+
+        price = None
+        for pattern in price_patterns:
+            match = re.search(pattern, html)
+            if match:
+                try:
+                    price = float(match.group(1).replace(",", ""))
+                    break
+                except:
+                    continue
+
+        # Extract change percentage
+        ch_patterns = [
+            r'([+-]?\d+\.?\d*)\s*%',
+            r'data-pct-change="([^"]+)"',
+        ]
+
+        ch = 0.0
+        for pattern in ch_patterns:
+            match = re.search(pattern, html)
+            if match:
+                try:
+                    ch = float(match.group(1))
+                    break
+                except:
+                    continue
+
+        if price:
+            return round(price, 2), round(ch, 2)
         return None, None
 
-def fetch_yf_history(symbol: str, points: int = 24):
-    """Fetch intraday history for chart data."""
-    try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="1d", interval="15m")
-        if hist.empty:
-            hist = ticker.history(period="5d", interval="1h")
-        closes = hist["Close"].dropna().tolist()[-points:]
-        times  = [str(t)[-8:-3] for t in hist.index.tolist()[-points:]]
-        return [{"t": t, "v": round(v, 2)} for t, v in zip(times, closes)]
     except Exception as e:
-        print(f"yfinance history error for {symbol}: {e}")
-        return []
+        print(f"Google Finance error for {ticker}: {e}")
+        return None, None
 
-# ── NSE India unofficial endpoints ────────────────────────────────────────────
+
+# ── NSE India ─────────────────────────────────────────────────────────────────
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
     "Referer": "https://www.nseindia.com/",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 def fetch_nse_indices():
-    """Fetch Nifty 50, Bank Nifty etc from NSE's own website (free, near real-time)."""
+    """Fetch Indian indices from NSE official website."""
     try:
         session = requests.Session()
-        # First hit the main page to get cookies
-        session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=8)
+        session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+        time.sleep(1)
         r = session.get(
             "https://www.nseindia.com/api/allIndices",
-            headers=NSE_HEADERS, timeout=8
+            headers=NSE_HEADERS, timeout=10
         )
         data = r.json().get("data", [])
         result = {}
         index_map = {
-            "NIFTY 50":         "nifty50",
-            "NIFTY BANK":       "bankNifty",
-            "NIFTY IT":         "niftyIT",
-            "NIFTY NEXT 50":    "niftyNext50",
-            "NIFTY MIDCAP 100": "niftyMidcap",
+            "NIFTY 50":    "nifty50",
+            "NIFTY BANK":  "bankNifty",
+            "NIFTY IT":    "niftyIT",
         }
         for item in data:
             key = index_map.get(item.get("index", ""))
             if key:
+                price = float(item.get("last", 0))
+                ch    = float(item.get("percentChange", 0))
                 result[key] = {
-                    "price": round(float(item.get("last", 0)), 2),
-                    "ch":    round(float(item.get("percentChange", 0)), 2),
-                    "open":  round(float(item.get("open", 0)), 2),
+                    "price": round(price, 2),
+                    "ch":    round(ch, 2),
                     "high":  round(float(item.get("dayHigh", 0)), 2),
                     "low":   round(float(item.get("dayLow", 0)), 2),
                 }
         return result
     except Exception as e:
-        print(f"NSE API error: {e}")
+        print(f"NSE error: {e}")
         return {}
 
-def fetch_nse_stock(symbol: str):
-    """Fetch individual NSE stock quote."""
+
+# ── MCX Gold/Silver prices ─────────────────────────────────────────────────────
+def fetch_mcx_prices():
+    """Fetch MCX commodity prices from moneycontrol (free, no key needed)."""
     try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=8)
-        r = session.get(
-            f"https://www.nseindia.com/api/quote-equity?symbol={symbol}",
-            headers=NSE_HEADERS, timeout=8
+        result = {}
+
+        # Gold MCX
+        r = requests.get(
+            "https://priceapi.moneycontrol.com/pricefeed/commodity/M/GOLD",
+            headers=HEADERS, timeout=8
         )
         d = r.json()
-        price_data = d.get("priceInfo", {})
-        return {
-            "price": round(float(price_data.get("lastPrice", 0)), 2),
-            "ch":    round(float(price_data.get("pChange", 0)), 2),
-            "open":  round(float(price_data.get("open", 0)), 2),
-            "high":  round(float(price_data.get("intraDayHighLow", {}).get("max", 0)), 2),
-            "low":   round(float(price_data.get("intraDayHighLow", {}).get("min", 0)), 2),
-        }
-    except Exception as e:
-        print(f"NSE stock error for {symbol}: {e}")
-        return None
+        if d.get("data"):
+            price = float(d["data"].get("pricecurrent", 0))
+            prev  = float(d["data"].get("priceprevclose", price))
+            ch    = round((price - prev) / prev * 100, 2) if prev else 0
+            result["gold"] = {"price": round(price, 0), "ch": ch, "unit": "₹/10g"}
 
-# ── Free RSS news feeds ───────────────────────────────────────────────────────
+        # Silver MCX
+        r = requests.get(
+            "https://priceapi.moneycontrol.com/pricefeed/commodity/M/SILVER",
+            headers=HEADERS, timeout=8
+        )
+        d = r.json()
+        if d.get("data"):
+            price = float(d["data"].get("pricecurrent", 0))
+            prev  = float(d["data"].get("priceprevclose", price))
+            ch    = round((price - prev) / prev * 100, 2) if prev else 0
+            result["silver"] = {"price": round(price, 0), "ch": ch, "unit": "₹/kg"}
+
+        # Crude MCX
+        r = requests.get(
+            "https://priceapi.moneycontrol.com/pricefeed/commodity/M/CRUDEOIL",
+            headers=HEADERS, timeout=8
+        )
+        d = r.json()
+        if d.get("data"):
+            price = float(d["data"].get("pricecurrent", 0))
+            prev  = float(d["data"].get("priceprevclose", price))
+            ch    = round((price - prev) / prev * 100, 2) if prev else 0
+            result["crude"] = {"price": round(price, 0), "ch": ch, "unit": "₹/bbl"}
+
+        return result
+
+    except Exception as e:
+        print(f"MCX error: {e}")
+        return {}
+
+
+# ── RSS News ──────────────────────────────────────────────────────────────────
 RSS_FEEDS = [
     ("ET Markets",    "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
     ("Moneycontrol",  "https://www.moneycontrol.com/rss/business.xml"),
@@ -191,22 +215,16 @@ RSS_FEEDS = [
 ]
 
 def fetch_news(limit: int = 20):
-    """Fetch news from multiple free RSS feeds."""
-    articles = []
     cached = cache_get("news")
     if cached:
         return cached
-
+    articles = []
     for source, url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:4]:
                 published = entry.get("published_parsed") or entry.get("updated_parsed")
-                if published:
-                    dt = datetime(*published[:6])
-                    time_str = dt.strftime("%H:%M")
-                else:
-                    time_str = "—"
+                time_str = datetime(*published[:6]).strftime("%H:%M") if published else "—"
                 articles.append({
                     "time":     time_str,
                     "source":   source,
@@ -215,13 +233,12 @@ def fetch_news(limit: int = 20):
                     "summary":  entry.get("summary", "")[:120] if entry.get("summary") else "",
                 })
         except Exception as e:
-            print(f"RSS error for {source}: {e}")
-
-    # Sort by time descending
+            print(f"RSS error {source}: {e}")
     articles.sort(key=lambda x: x["time"], reverse=True)
     result = articles[:limit]
     cache_set("news", result)
     return result
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # API ROUTES
@@ -231,198 +248,145 @@ def fetch_news(limit: int = 20):
 def root():
     return {"status": "Bazaar Watch API running", "time": datetime.now().isoformat()}
 
+
 @app.get("/api/indices")
 def get_indices():
-    """Indian + Gift Nifty data. Uses NSE first, falls back to yfinance."""
     cached = cache_get("indices")
     if cached:
         return cached
 
     result = {}
 
-    # Try NSE unofficial API first (most accurate, near real-time)
-    nse_data = fetch_nse_indices()
-    if nse_data:
-        result.update(nse_data)
+    # Try NSE first (most accurate)
+    nse = fetch_nse_indices()
+    result.update(nse)
 
-    # Fill gaps with yfinance (15-min delay but reliable)
-    for key in ["nifty50", "bankNifty", "niftyIT", "sensex"]:
-        if key not in result:
-            symbol = YF_SYMBOLS.get(key)
-            if symbol:
-                price, ch = fetch_yf_price(symbol)
-                if price:
-                    result[key] = {"price": round(price, 2), "ch": ch or 0}
+    # Sensex from Google Finance
+    price, ch = fetch_google_finance("SENSEX", "INDEXBOM")
+    if price:
+        result["sensex"] = {"price": price, "ch": ch or 0}
 
-    # Gift Nifty — use SGX Nifty proxy (NSE SGX)
-    # Real Gift Nifty requires NSE IFSC data; use Nifty 50 + small premium as proxy
+    # Gift Nifty proxy — Nifty + small premium
     if "nifty50" in result:
-        n50 = result["nifty50"]["price"]
         result["giftNifty"] = {
-            "price": round(n50 * 1.0015, 2),  # ~0.15% SGX premium
+            "price": round(result["nifty50"]["price"] * 1.002, 2),
             "ch":    result["nifty50"]["ch"]
         }
 
+    print(f"Indices result: {result}")
     cache_set("indices", result)
     return result
 
+
 @app.get("/api/commodities")
 def get_commodities():
-    """Gold, Silver, Crude, Base Metals — MCX prices in INR."""
     cached = cache_get("commodities")
     if cached:
         return cached
 
-    # Get USD/INR first
-    usdinr_price, usdinr_ch = fetch_yf_price("INR=X")
-    rate = usdinr_price if usdinr_price else 83.5
+    result = {}
 
-    result = {"usdinr": {"price": round(rate, 2), "ch": usdinr_ch or 0}}
+    # USD/INR from Google Finance
+    price, ch = fetch_google_finance("USD-INR", "")
+    if price:
+        result["usdinr"] = {"price": price, "ch": ch or 0}
+    else:
+        result["usdinr"] = {"price": 83.5, "ch": 0}
 
-    for key in ["gold", "silver", "crude", "copper", "aluminium", "zinc", "nickel"]:
-        symbol = YF_SYMBOLS.get(key)
-        if not symbol:
-            continue
-        price, ch = fetch_yf_price(symbol)
-        if price and key in MCX_CONVERT:
-            inr_price = MCX_CONVERT[key](price, rate)
+    rate = result["usdinr"]["price"]
+
+    # MCX prices (INR directly)
+    mcx = fetch_mcx_prices()
+    result.update(mcx)
+
+    # Base metals from Google Finance (USD) → convert to INR
+    metals = {
+        "copper":    ("COPPER", "COMMODITY"),
+        "aluminium": ("ALU",    "COMMODITY"),
+        "zinc":      ("ZINC",   "COMMODITY"),
+        "nickel":    ("NICKEL", "COMMODITY"),
+    }
+    for key, (ticker, exchange) in metals.items():
+        price, ch = fetch_google_finance(ticker, exchange)
+        if price:
             result[key] = {
-                "price": inr_price,
+                "price": round(price * rate * 2.20462, 2),
                 "ch":    ch or 0,
-                "usd":   round(price, 4),
-                "unit":  "₹/10g" if key=="gold" else "₹/kg" if key in ["silver","copper","aluminium","zinc","nickel"] else "₹/bbl"
+                "unit":  "₹/kg"
             }
 
+    print(f"Commodities result: {result}")
     cache_set("commodities", result)
     return result
 
+
 @app.get("/api/us-markets")
 def get_us_markets():
-    """DJI, S&P 500, Dow Futures, DXY, 10Y Bond."""
     cached = cache_get("us_markets")
     if cached:
         return cached
 
     result = {}
-    us_symbols = {
-        "dji":        "^DJI",
-        "sp500":      "^GSPC",
-        "dowFutures": "YM=F",
-        "dxy":        "DX-Y.NYB",
-        "bond10y":    "^TNX",
-    }
-    for key, symbol in us_symbols.items():
-        price, ch = fetch_yf_price(symbol)
-        if price:
-            result[key] = {"price": round(price, 3 if key=="bond10y" else 2), "ch": ch or 0}
 
+    markets = {
+        "dji":        ("DJI",    "INDEXDJX"),
+        "sp500":      ("INX",    "INDEXSP"),
+        "dowFutures": ("YMW00",  "CBOT"),
+        "dxy":        ("DXY",    ""),
+        "bond10y":    ("US10Y",  ""),
+    }
+
+    for key, (ticker, exchange) in markets.items():
+        price, ch = fetch_google_finance(ticker, exchange)
+        if price:
+            result[key] = {"price": price, "ch": ch or 0}
+
+    print(f"US Markets result: {result}")
     cache_set("us_markets", result)
     return result
 
+
 @app.get("/api/world-markets")
 def get_world_markets():
-    """12 global indices."""
     cached = cache_get("world_markets")
     if cached:
         return cached
 
-    world_symbols = {
-        "Nikkei 225":   "^N225",
-        "Hang Seng":    "^HSI",
-        "Shanghai":     "000001.SS",
-        "FTSE 100":     "^FTSE",
-        "DAX":          "^GDAXI",
-        "CAC 40":       "^FCHI",
-        "KOSPI":        "^KS11",
-        "ASX 200":      "^AXJO",
-        "Taiwan Wt.":   "^TWII",
-        "Jakarta":      "^JKSE",
-        "STI (SGX)":    "^STI",
-        "IBOVESPA":     "^BVSP",
-    }
+    world = [
+        ("Nikkei 225",  "NI225",   "INDEXNIKKEI"),
+        ("Hang Seng",   "HSI",     "INDEXHANGSENG"),
+        ("Shanghai",    "000001",  "SHA"),
+        ("FTSE 100",    "UKX",     "INDEXFTSE"),
+        ("DAX",         "DAX",     "INDEXDB"),
+        ("CAC 40",      "PX1",     "INDEXEURONEXT"),
+        ("KOSPI",       "KOSPI",   "INDEXKRX"),
+        ("ASX 200",     "XJO",     "INDEXASX"),
+        ("Taiwan Wt.",  "TWII",    "INDEXTAIEX"),
+        ("Jakarta",     "COMPOSITE","INDEXIDX"),
+        ("STI (SGX)",   "STI",     "INDEXFTSE"),
+        ("IBOVESPA",    "IBOV",    "INDEXBVMF"),
+    ]
 
     result = []
-    for name, symbol in world_symbols.items():
-        price, ch = fetch_yf_price(symbol)
+    for name, ticker, exchange in world:
+        price, ch = fetch_google_finance(ticker, exchange)
         if price:
             result.append({
-                "name": name,
-                "price": round(price, 2),
-                "ch": ch or 0,
-                "formatted": f"{price:,.0f}"
+                "name":      name,
+                "price":     price,
+                "ch":        ch or 0,
+                "formatted": f"{price:,.2f}"
             })
 
+    print(f"World markets: {len(result)} fetched")
     cache_set("world_markets", result)
     return result
 
-@app.get("/api/chart/{key}")
-def get_chart(key: str):
-    """Intraday chart data for any instrument."""
-    cached = cache_get(f"chart_{key}")
-    if cached:
-        return cached
-
-    symbol = YF_SYMBOLS.get(key)
-    if not symbol:
-        return {"error": f"Unknown symbol: {key}"}
-
-    data = fetch_yf_history(symbol, points=30)
-    cache_set(f"chart_{key}", data)
-    return data
-
-@app.get("/api/heatmap")
-def get_heatmap():
-    """
-    Nifty 500 stock data for heatmap.
-    Fetches batch quotes from NSE for top stocks.
-    Falls back to yfinance for missing ones.
-    """
-    cached = cache_get("heatmap")
-    if cached:
-        return cached
-
-    # Key stocks to fetch (NSE symbols)
-    STOCKS = [
-        "HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK",
-        "TCS","INFY","HCLTECH","WIPRO","TECHM","LTIM",
-        "RELIANCE","ONGC","NTPC","POWERGRID","ADANIGREEN","TATAPOWER",
-        "BAJFINANCE","BAJAJFINSV","HDFCLIFE","SBILIFE",
-        "MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","EICHERMOT",
-        "HINDUNILVR","ITC","NESTLEIND","BRITANNIA",
-        "LT","HAL","BEL","SIEMENS","BHEL","POLYCAB",
-        "SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","APOLLOHOSP",
-        "TATASTEEL","JSWSTEEL","HINDALCO","VEDL","COALINDIA",
-        "TITAN","ZOMATO","DMART","TRENT",
-        "DLF","GODREJPROP","ULTRACEMCO","GRASIM",
-        "BHARTIARTL","PIDILITIND","INDIGO",
-    ]
-
-    result = {}
-    # Use yfinance batch download — much faster than individual calls
-    try:
-        symbols_ns = [f"{s}.NS" for s in STOCKS]
-        data = yf.download(symbols_ns, period="2d", interval="1d",
-                           group_by="ticker", auto_adjust=True, progress=False)
-        for s, sym_ns in zip(STOCKS, symbols_ns):
-            try:
-                closes = data[sym_ns]["Close"].dropna()
-                if len(closes) >= 2:
-                    latest = float(closes.iloc[-1])
-                    prev   = float(closes.iloc[-2])
-                    ch     = round((latest - prev) / prev * 100, 2)
-                    result[s] = {"price": round(latest, 2), "ch": ch}
-            except:
-                pass
-    except Exception as e:
-        print(f"Batch yfinance error: {e}")
-
-    cache_set("heatmap", result)
-    return result
 
 @app.get("/api/news")
 def get_news():
-    """Financial news from free RSS feeds."""
     return fetch_news(limit=20)
+
 
 @app.get("/api/all")
 def get_all():
@@ -434,9 +398,9 @@ def get_all():
         "news":         fetch_news(limit=15),
         "lastUpdated":  datetime.now().isoformat(),
     }
-    }
 
-# ── Run directly ──────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
