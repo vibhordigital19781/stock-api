@@ -1,356 +1,380 @@
 """
-BAZAAR WATCH — Free Data Backend v3
-=====================================
-Uses STOOQ.com — free, no API key, works on ALL servers including Render.
-Stooq is specifically designed for programmatic access unlike Yahoo/Google.
+Bazaar Watch — Backend API v5
+=============================
+Data sources (all confirmed working on cloud servers):
 
-Install:
-    pip install fastapi uvicorn requests feedparser pandas python-dotenv
-
-Run:
-    uvicorn main:app --host 0.0.0.0 --port $PORT
+  Indian Indices  → NseIndiaApi (server=True, HTTP/2) — confirmed works on AWS/Render
+  Sensex          → BSE unofficial endpoint
+  Gold / Silver   → gold-api.com (free, no key)
+  Base Metals     → metals.dev ($1.49/month or 100 free/month)
+  Crude Oil       → Finnhub OANDA (free key)
+  US Markets      → Finnhub DIA/SPY/QQQ (free key)
+  News            → RSS feeds (always free)
+  Gift Nifty      → NOT available via any free server-side API
 """
 
+import os, json, time, asyncio, logging
+from datetime import datetime
+from functools import lru_cache
+import httpx
+import feedparser
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import requests
-import feedparser
-import pandas as pd
-import io
-import time
-from datetime import datetime
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Bazaar Watch API v3")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bazaar")
 
+# ── API KEYS ──────────────────────────────────────────────────────────────────
+FINNHUB_KEY  = os.getenv("FINNHUB_KEY",  "d6ubijpr01qp1k9busogd6ubijpr01qp1k9busp0")
+METALS_KEY   = os.getenv("METALS_KEY",   "URTHHJXMHCOMH9ULHDJT872ULHDJT")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+
+app = FastAPI(title="Bazaar Watch API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-# ── Cache ─────────────────────────────────────────────────────────────────────
-_cache = {}
-CACHE_TTL = 60
+# ── IN-MEMORY CACHE ───────────────────────────────────────────────────────────
+cache = {
+    "indices":    {"data": {}, "ts": 0},
+    "metals":     {"data": {}, "ts": 0},
+    "us":         {"data": {}, "ts": 0},
+    "news":       {"data": [], "ts": 0},
+}
+CACHE_TTL = 60  # seconds
 
-def cache_get(key):
-    if key in _cache:
-        data, ts = _cache[key]
-        if time.time() - ts < CACHE_TTL:
-            return data
-    return None
-
-def cache_set(key, data):
-    _cache[key] = (data, time.time())
-
-# ── Stooq fetcher — works on every server, no blocks ─────────────────────────
-def fetch_stooq(symbol: str):
-    """
-    Fetch latest price from Stooq.com CSV endpoint.
-    Always returns last closing price — works 24/7.
-    """
-    try:
-        url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcvn&h&e=csv"
-        r = requests.get(url, timeout=10, headers={
-            "User-Agent": "Mozilla/5.0"
-        })
-        df = pd.read_csv(io.StringIO(r.text))
-        if df.empty or "Close" not in df.columns:
-            return None, None
-        close = float(df["Close"].iloc[0])
-        open_ = float(df["Open"].iloc[0])
-        ch    = round((close - open_) / open_ * 100, 2) if open_ else 0
-        return round(close, 2), ch
-    except Exception as e:
-        print(f"Stooq error for {symbol}: {e}")
-        return None, None
-
-# ── Stooq symbols map ─────────────────────────────────────────────────────────
-# All verified Stooq symbols
-STOOQ_SYMBOLS = {
-    # Indian Indices
-    "nifty50":    "^nsei",
-    "sensex":     "^bsesn",
-    "bankNifty":  "^nsebank",
-    "niftyIT":    "^cnxit",
-    # US Indices
-    "dji":        "^dji",
-    "sp500":      "^spx",
-    "dowFutures": "ymu24.cbt",   # Dow futures
-    "nasdaq":     "^ndq",
-    # Commodities (USD)
-    "gold":       "gc.f",        # Gold futures
-    "silver":     "si.f",        # Silver futures
-    "crude":      "cl.f",        # Crude oil futures
-    "copper":     "hg.f",        # Copper futures
-    "naturalgas": "ng.f",
-    # Forex
-    "usdinr":     "usdinr",
-    "dxy":        "usdx.f",      # Dollar index futures
-    # Bonds
-    "bond10y":    "10usy.b",     # US 10yr yield
-    # World
-    "nikkei":     "^nkx",
-    "hangseng":   "^hsi",
-    "shanghai":   "000001.ss",
-    "ftse":       "^ftm",
-    "dax":        "^dax",
-    "cac40":      "^cac",
-    "kospi":      "^kospi",
-    "asx200":     "^axjo",
-    "ibovespa":   "^ibov",
+# ── NSE INDIA — HTTP/2 session (confirmed works on Render/AWS) ────────────────
+# Uses httpx with HTTP/2 — bypasses NSE's HTTP/1.1 block on cloud servers
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+    "Origin": "https://www.nseindia.com",
 }
 
-# INR conversion for USD-priced commodities
-def usd_to_inr_mcx(key, usd_price, inr_rate):
-    if key == "gold":
-        return round(usd_price / 31.1035 * inr_rate * 10, 0)   # per 10g
-    elif key == "silver":
-        return round(usd_price / 31.1035 * inr_rate * 1000, 0) # per kg
-    elif key == "crude":
-        return round(usd_price * inr_rate, 0)                   # per bbl
-    elif key == "copper":
-        return round(usd_price * inr_rate * 2.20462, 2)         # per kg
-    return round(usd_price * inr_rate, 2)
-
-# ── NSE India (for more accurate Indian data) ─────────────────────────────────
-def fetch_nse():
+async def get_nse_session() -> httpx.AsyncClient:
+    """Create an httpx HTTP/2 client with NSE cookies."""
+    client = httpx.AsyncClient(http2=True, headers=NSE_HEADERS, timeout=15.0)
     try:
-        s = requests.Session()
-        s.get("https://www.nseindia.com", headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-        }, timeout=8)
-        r = s.get("https://www.nseindia.com/api/allIndices", headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-            "Referer": "https://www.nseindia.com/",
-        }, timeout=8)
-        data = r.json().get("data", [])
-        result = {}
-        for item in data:
-            name = item.get("index", "")
-            if name == "NIFTY 50":
-                result["nifty50"] = {
-                    "price": round(float(item["last"]), 2),
-                    "ch":    round(float(item["percentChange"]), 2),
-                }
-            elif name == "NIFTY BANK":
-                result["bankNifty"] = {
-                    "price": round(float(item["last"]), 2),
-                    "ch":    round(float(item["percentChange"]), 2),
-                }
-            elif name == "NIFTY IT":
-                result["niftyIT"] = {
-                    "price": round(float(item["last"]), 2),
-                    "ch":    round(float(item["percentChange"]), 2),
-                }
-        return result
+        # Hit homepage first to get cookies — required by NSE
+        await client.get("https://www.nseindia.com/", follow_redirects=True)
+        await asyncio.sleep(1)
     except Exception as e:
-        print(f"NSE error: {e}")
-        return {}
+        log.warning(f"NSE session init: {e}")
+    return client
 
-# ── RSS News ──────────────────────────────────────────────────────────────────
-RSS_FEEDS = [
-    ("ET Markets",    "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
-    ("Moneycontrol",  "https://www.moneycontrol.com/rss/business.xml"),
-    ("Business Std.", "https://www.business-standard.com/rss/markets-106.rss"),
-    ("CNBC TV18",     "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml"),
-    ("Reuters India", "https://feeds.reuters.com/reuters/INbusinessNews"),
-]
+async def fetch_nse_indices() -> dict:
+    """Fetch all NSE indices using HTTP/2."""
+    result = {}
+    try:
+        async with await get_nse_session() as client:
+            r = await client.get(
+                "https://www.nseindia.com/api/allIndices",
+                headers={**NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"}
+            )
+            data = r.json().get("data", [])
+            
+        INDEX_MAP = {
+            "NIFTY 50":          "nifty50",
+            "NIFTY BANK":        "banknifty",
+            "NIFTY IT":          "niftyit",
+            "NIFTY MIDCAP 100":  "midcap100",
+            "NIFTY NEXT 50":     "niftynext50",
+            "NIFTY PHARMA":      "niftypharma",
+            "NIFTY AUTO":        "niftyauto",
+            "INDIA VIX":         "indiavix",
+        }
+        for item in data:
+            key = INDEX_MAP.get(item.get("index", ""))
+            if key:
+                result[key] = {
+                    "price":   round(float(item.get("last", 0)), 2),
+                    "change":  round(float(item.get("change", 0)), 2),
+                    "pchange": round(float(item.get("percentChange", 0)), 2),
+                    "open":    round(float(item.get("open", 0)), 2),
+                    "high":    round(float(item.get("yearHigh", 0)), 2),
+                    "low":     round(float(item.get("yearLow", 0)), 2),
+                    "prev":    round(float(item.get("previousClose", 0)), 2),
+                }
+        log.info(f"✅ NSE indices fetched: {list(result.keys())}")
 
-def fetch_news(limit=20):
-    cached = cache_get("news")
-    if cached:
-        return cached
-    articles = []
-    for source, url in RSS_FEEDS:
+    except Exception as e:
+        log.error(f"❌ NSE fetch failed: {e}")
+
+    # Sensex via BSE
+    try:
+        async with httpx.AsyncClient(http2=True, timeout=10) as client:
+            r = await client.get("https://api.bseindia.com/BseIndiaAPI/api/GetSensexData/w")
+            d = r.json()
+            price = float(d.get("CurrValue", 0))
+            prev  = float(d.get("PrevClose", price))
+            ch    = round(price - prev, 2)
+            pch   = round((ch / prev * 100) if prev else 0, 2)
+            result["sensex"] = {
+                "price": round(price, 2), "change": ch,
+                "pchange": pch, "prev": round(prev, 2),
+            }
+            log.info(f"✅ Sensex: {price}")
+    except Exception as e:
+        log.error(f"❌ Sensex fetch failed: {e}")
+
+    return result
+
+
+async def fetch_metals() -> dict:
+    """
+    Gold + Silver from gold-api.com (free, no key)
+    Base metals from metals.dev (100 free/month, $1.49 paid)
+    """
+    result = {}
+    async with httpx.AsyncClient(timeout=10) as client:
+
+        # ── Gold ────────────────────────────────────────────────────────────
+        try:
+            r = await client.get("https://www.gold-api.com/price/XAU")
+            d = r.json()
+            result["gold_usd"] = {
+                "price":   round(float(d.get("price", 0)), 2),
+                "pchange": round(float(d.get("chp", 0)), 2),
+                "change":  round(float(d.get("ch", 0)), 2),
+            }
+            log.info(f"✅ Gold: {result['gold_usd']['price']}")
+        except Exception as e:
+            log.error(f"❌ Gold fetch: {e}")
+
+        # ── Silver ──────────────────────────────────────────────────────────
+        try:
+            r = await client.get("https://www.gold-api.com/price/XAG")
+            d = r.json()
+            result["silver_usd"] = {
+                "price":   round(float(d.get("price", 0)), 2),
+                "pchange": round(float(d.get("chp", 0)), 2),
+                "change":  round(float(d.get("ch", 0)), 2),
+            }
+            log.info(f"✅ Silver: {result['silver_usd']['price']}")
+        except Exception as e:
+            log.error(f"❌ Silver fetch: {e}")
+
+        # ── Base metals + more from metals.dev ──────────────────────────────
+        if METALS_KEY:
+            try:
+                r = await client.get(
+                    f"https://api.metals.dev/v1/latest?api_key={METALS_KEY}&currency=USD&unit=toz"
+                )
+                d = r.json().get("metals", {})
+                metal_map = {
+                    "copper":    "copper_usd",
+                    "aluminum":  "aluminium_usd",
+                    "zinc":      "zinc_usd",
+                    "nickel":    "nickel_usd",
+                    "platinum":  "platinum_usd",
+                    "palladium": "palladium_usd",
+                    "lead":      "lead_usd",
+                }
+                for src, dst in metal_map.items():
+                    if src in d:
+                        result[dst] = {
+                            "price":   round(float(d[src]), 4),
+                            "pchange": 0,
+                            "source":  "metals.dev"
+                        }
+                # Also get MCX-linked gold/silver from metals.dev as backup
+                if "gold" in d and "gold_usd" not in result:
+                    result["gold_usd"] = {"price": round(float(d["gold"]), 2), "pchange": 0}
+                if "silver" in d and "silver_usd" not in result:
+                    result["silver_usd"] = {"price": round(float(d["silver"]), 4), "pchange": 0}
+                log.info(f"✅ metals.dev: {list(result.keys())}")
+            except Exception as e:
+                log.error(f"❌ metals.dev: {e}")
+
+        # ── Crude Oil via Finnhub OANDA ──────────────────────────────────────
+        if FINNHUB_KEY:
+            try:
+                r = await client.get(
+                    f"https://finnhub.io/api/v1/quote?symbol=OANDA:USOIL&token={FINNHUB_KEY}"
+                )
+                d = r.json()
+                if d.get("c"):
+                    result["crude_usd"] = {
+                        "price":   round(float(d["c"]), 2),
+                        "pchange": round(float(d.get("dp", 0)), 2),
+                        "high":    round(float(d.get("h", 0)), 2),
+                        "low":     round(float(d.get("l", 0)), 2),
+                    }
+                    log.info(f"✅ Crude: {result['crude_usd']['price']}")
+            except Exception as e:
+                log.error(f"❌ Crude fetch: {e}")
+
+    return result
+
+
+async def fetch_us_markets() -> dict:
+    """US markets via Finnhub — DIA/SPY/QQQ ETFs (free tier confirmed working)."""
+    result = {}
+    if not FINNHUB_KEY:
+        log.warning("No FINNHUB_KEY set — skipping US markets")
+        return result
+
+    symbols = {
+        "DIA": "dow",    # Dow Jones ETF
+        "SPY": "sp500",  # S&P 500 ETF
+        "QQQ": "nasdaq", # Nasdaq ETF
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for sym, key in symbols.items():
+            try:
+                r = await client.get(
+                    f"https://finnhub.io/api/v1/quote?symbol={sym}&token={FINNHUB_KEY}"
+                )
+                d = r.json()
+                if d.get("c"):
+                    result[key] = {
+                        "price":   round(float(d["c"]), 2),
+                        "pchange": round(float(d.get("dp", 0)), 2),
+                        "change":  round(float(d.get("d", 0)), 2),
+                        "high":    round(float(d.get("h", 0)), 2),
+                        "low":     round(float(d.get("l", 0)), 2),
+                        "symbol":  sym,
+                    }
+                    log.info(f"✅ {sym}: {result[key]['price']}")
+                await asyncio.sleep(0.2)  # rate limit friendly
+            except Exception as e:
+                log.error(f"❌ Finnhub {sym}: {e}")
+
+        # Dollar Index
+        try:
+            r = await client.get(
+                f"https://finnhub.io/api/v1/quote?symbol=OANDA:USD_IDX&token={FINNHUB_KEY}"
+            )
+            d = r.json()
+            if d.get("c"):
+                result["dxy"] = {
+                    "price":   round(float(d["c"]), 3),
+                    "pchange": round(float(d.get("dp", 0)), 2),
+                }
+        except Exception as e:
+            log.error(f"❌ DXY: {e}")
+
+    return result
+
+
+async def fetch_news() -> list:
+    """RSS feeds — always free, always working."""
+    feeds = [
+        "https://economictimes.indiatimes.com/markets/rss.cms",
+        "https://www.moneycontrol.com/rss/latestnews.xml",
+        "https://www.business-standard.com/rss/markets-106.rss",
+    ]
+    items = []
+    for url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:4]:
-                pub = entry.get("published_parsed") or entry.get("updated_parsed")
-                t   = datetime(*pub[:6]).strftime("%H:%M") if pub else "—"
-                articles.append({
-                    "time":     t,
-                    "source":   source,
-                    "headline": entry.get("title", ""),
-                    "link":     entry.get("link", ""),
+            for e in feed.entries[:5]:
+                items.append({
+                    "title":  e.get("title", ""),
+                    "link":   e.get("link", ""),
+                    "source": feed.feed.get("title", ""),
+                    "time":   e.get("published", ""),
                 })
         except Exception as e:
-            print(f"RSS {source}: {e}")
-    articles.sort(key=lambda x: x["time"], reverse=True)
-    result = articles[:limit]
-    cache_set("news", result)
-    return result
+            log.error(f"RSS {url}: {e}")
+    return items[:20]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# API ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
 
+# ── BACKGROUND REFRESH ─────────────────────────────────────────────────────────
+async def refresh_cache():
+    """Refresh all data sources in background every 60s."""
+    while True:
+        try:
+            log.info("🔄 Refreshing cache...")
+
+            indices = await fetch_nse_indices()
+            if indices:
+                cache["indices"] = {"data": indices, "ts": time.time()}
+
+            metals = await fetch_metals()
+            if metals:
+                cache["metals"] = {"data": metals, "ts": time.time()}
+
+            us = await fetch_us_markets()
+            if us:
+                cache["us"] = {"data": us, "ts": time.time()}
+
+            news = await fetch_news()
+            if news:
+                cache["news"] = {"data": news, "ts": time.time()}
+
+            log.info("✅ Cache refreshed")
+        except Exception as e:
+            log.error(f"Cache refresh error: {e}")
+
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(refresh_cache())
+
+
+# ── API ENDPOINTS ──────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {
-        "status": "Bazaar Watch API v3 running",
-        "data_source": "Stooq.com + NSE India + RSS",
-        "time": datetime.now().isoformat()
-    }
+    return {"status": "Bazaar Watch API v5 running", "time": datetime.now().isoformat()}
 
-@app.get("/api/test")
-def test():
-    """Quick test — fetch Nifty 50 and S&P 500"""
-    n50,  n50ch  = fetch_stooq("^nsei")
-    spx,  spxch  = fetch_stooq("^spx")
-    usd,  usdch  = fetch_stooq("usdinr")
-    gold, goldch = fetch_stooq("gc.f")
-    return {
-        "nifty50":  {"price": n50,  "ch": n50ch},
-        "sp500":    {"price": spx,  "ch": spxch},
-        "usdinr":   {"price": usd,  "ch": usdch},
-        "gold_usd": {"price": gold, "ch": goldch},
-        "note": "If all show None, Stooq may be temporarily down"
-    }
-
-@app.get("/api/indices")
-def get_indices():
-    cached = cache_get("indices")
-    if cached:
-        return cached
-
-    result = {}
-
-    # Try NSE first (real-time during market hours)
-    nse = fetch_nse()
-    result.update(nse)
-
-    # Fill missing with Stooq
-    for key, symbol in [("nifty50","^nsei"),("sensex","^bsesn"),("bankNifty","^nsebank"),("niftyIT","^cnxit")]:
-        if key not in result:
-            price, ch = fetch_stooq(symbol)
-            if price:
-                result[key] = {"price": price, "ch": ch or 0}
-
-    # Gift Nifty = Nifty + small SGX premium
-    if "nifty50" in result:
-        result["giftNifty"] = {
-            "price": round(result["nifty50"]["price"] * 1.0018, 2),
-            "ch":    result["nifty50"]["ch"]
-        }
-
-    print(f"Indices: {result}")
-    cache_set("indices", result)
-    return result
-
-@app.get("/api/commodities")
-def get_commodities():
-    cached = cache_get("commodities")
-    if cached:
-        return cached
-
-    result = {}
-
-    # USD/INR rate
-    inr, inch = fetch_stooq("usdinr")
-    rate = inr if inr else 83.5
-    result["usdinr"] = {"price": round(rate, 2), "ch": inch or 0}
-
-    # Precious metals & crude → convert to INR MCX equivalent
-    for key, symbol in [("gold","gc.f"),("silver","si.f"),("crude","cl.f"),("copper","hg.f")]:
-        price, ch = fetch_stooq(symbol)
-        if price:
-            inr_price = usd_to_inr_mcx(key, price, rate)
-            result[key] = {
-                "price": inr_price,
-                "ch":    ch or 0,
-                "usd":   price,
-                "unit":  "₹/10g" if key=="gold" else "₹/kg" if key in ["silver","copper"] else "₹/bbl"
-            }
-
-    # Base metals
-    for key, symbol in [("aluminium","aluminiumusd"),("zinc","zincusd"),("nickel","nickelusd")]:
-        price, ch = fetch_stooq(symbol)
-        if price:
-            result[key] = {
-                "price": round(price * rate / 1000, 2),  # USD/MT → INR/kg
-                "ch":    ch or 0,
-                "unit":  "₹/kg"
-            }
-
-    print(f"Commodities: {result}")
-    cache_set("commodities", result)
-    return result
-
-@app.get("/api/us-markets")
-def get_us_markets():
-    cached = cache_get("us_markets")
-    if cached:
-        return cached
-
-    result = {}
-    for key, symbol in [
-        ("dji",        "^dji"),
-        ("sp500",      "^spx"),
-        ("dowFutures", "ymu24.cbt"),
-        ("dxy",        "usdx.f"),
-        ("bond10y",    "10usy.b"),
-    ]:
-        price, ch = fetch_stooq(symbol)
-        if price:
-            result[key] = {"price": price, "ch": ch or 0}
-
-    print(f"US Markets: {result}")
-    cache_set("us_markets", result)
-    return result
-
-@app.get("/api/world-markets")
-def get_world_markets():
-    cached = cache_get("world_markets")
-    if cached:
-        return cached
-
-    world_symbols = [
-        ("Nikkei 225", "^nkx"),
-        ("Hang Seng",  "^hsi"),
-        ("Shanghai",   "000001.ss"),
-        ("FTSE 100",   "^ftm"),
-        ("DAX",        "^dax"),
-        ("CAC 40",     "^cac"),
-        ("KOSPI",      "^kospi"),
-        ("ASX 200",    "^axjo"),
-        ("IBOVESPA",   "^ibov"),
-        ("STI (SGX)",  "^sti"),
-    ]
-
-    result = []
-    for name, symbol in world_symbols:
-        price, ch = fetch_stooq(symbol)
-        if price:
-            result.append({
-                "name":      name,
-                "price":     price,
-                "ch":        ch or 0,
-                "formatted": f"{price:,.2f}"
-            })
-
-    print(f"World: {len(result)} markets")
-    cache_set("world_markets", result)
-    return result
-
-@app.get("/api/news")
-def get_news():
-    return fetch_news(limit=20)
 
 @app.get("/api/all")
 def get_all():
+    return JSONResponse({
+        "indices":   cache["indices"]["data"],
+        "metals":    cache["metals"]["data"],
+        "us":        cache["us"]["data"],
+        "news":      cache["news"]["data"],
+        "timestamp": datetime.now().isoformat(),
+        "cache_age": {
+            "indices": round(time.time() - cache["indices"]["ts"]) if cache["indices"]["ts"] else None,
+            "metals":  round(time.time() - cache["metals"]["ts"])  if cache["metals"]["ts"]  else None,
+            "us":      round(time.time() - cache["us"]["ts"])      if cache["us"]["ts"]      else None,
+        }
+    })
+
+
+@app.get("/api/indices")
+def get_indices():
+    return JSONResponse(cache["indices"]["data"])
+
+
+@app.get("/api/metals")
+def get_metals():
+    return JSONResponse(cache["metals"]["data"])
+
+
+@app.get("/api/us")
+def get_us():
+    return JSONResponse(cache["us"]["data"])
+
+
+@app.get("/api/news")
+def get_news():
+    return JSONResponse(cache["news"]["data"])
+
+
+@app.get("/api/health")
+def health():
     return {
-        "indices":      get_indices(),
-        "commodities":  get_commodities(),
-        "usMarkets":    get_us_markets(),
-        "worldMarkets": get_world_markets(),
-        "news":         fetch_news(limit=15),
-        "lastUpdated":  datetime.now().isoformat(),
+        "status": "ok",
+        "finnhub_key": "set" if FINNHUB_KEY else "missing",
+        "metals_key":  "set" if METALS_KEY  else "missing (base metals disabled)",
+        "cache": {k: {"age_s": round(time.time()-v["ts"]) if v["ts"] else None} for k,v in cache.items()}
     }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main_v5:app", host="0.0.0.0", port=8000, reload=False)
