@@ -1,11 +1,9 @@
 # ── Python dependencies ──────────────────────────────────────────────────────
-fastapi
-uvicorn
-requests
-feedparser
-pandas
-python-dotenv
-
+fastapi==0.110.0
+uvicorn==0.29.0
+httpx[http2]==0.27.0
+feedparser==6.0.11
+python-dotenv==1.0.0
 # ═══════════════════════════════════════════════════════════════════════════════
 # SETUP & RUN INSTRUCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
