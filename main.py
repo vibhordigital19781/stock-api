@@ -375,84 +375,86 @@ def health():
     }
 
 
-# ── GIFT NIFTY — investing.com unofficial API ─────────────────────────────────
-# Pair ID 2283114 = Gift Nifty 50 Futures (GIFc1) confirmed via community sources
-# Server-side fetch bypasses CORS + Cloudflare blocks that hit browser requests
-GIFT_NIFTY_PAIR_ID = "2283114"
+# ── GIFT NIFTY — investing.com tvc6 API (confirmed working) ──────────────────
+# tvc6.investing.com is the working endpoint — old api.investing.com returns 403
+# Pair ID 2283114 = Gift Nifty 50 Futures (GIFc1)
+GIFT_NIFTY_ID = "2283114"
 
-INVESTING_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://in.investing.com/indices/gift-nifty-50-c1-futures-chart",
-    "X-Requested-With": "XMLHttpRequest",
-    "domain-id": "in",
+INTERVAL_MAP = {
+    "1":  1,
+    "5":  5,
+    "15": 15,
+    "30": 30,
+    "60": 60,
+    "D":  "1D",
 }
 
-RESOLUTION_MAP = {
-    "1":  "PT1M",
-    "5":  "PT5M",
-    "15": "PT15M",
-    "30": "PT30M",
-    "60": "PT1H",
-    "D":  "P1D",
+TVC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://in.investing.com",
+    "Referer": "https://in.investing.com/",
 }
 
 async def fetch_gift_nifty_ohlc(resolution: str = "5", bars: int = 200) -> list:
     """
-    Fetch Gift Nifty OHLC data from investing.com unofficial API.
-    Returns list of {time, open, high, low, close, volume} dicts.
+    Fetch Gift Nifty OHLC from tvc6.investing.com — confirmed working endpoint.
+    Returns list of {time, open, high, low, close, volume} for lightweight-charts.
     """
-    period = RESOLUTION_MAP.get(resolution, "PT5M")
+    import time as time_module
+    interval = INTERVAL_MAP.get(resolution, 5)
+    now = int(time_module.time())
+    # Go back enough bars worth of seconds
+    seconds_per_bar = 60 if resolution == "D" else int(resolution) * 60
+    from_ts = now - (bars * seconds_per_bar * 2)
+
     url = (
-        f"https://api.investing.com/api/financialdata/{GIFT_NIFTY_PAIR_ID}"
-        f"/historical/chart/?period={period}&pointscount={bars}"
-        f"&interval={period}"
+        f"https://tvc6.investing.com/c7e949cd90d5b9cd9fd38de6c4cbf22c"
+        f"/1/{now}/1/{interval}/history"
+        f"?symbol={GIFT_NIFTY_ID}&resolution={interval}"
+        f"&from={from_ts}&to={now}"
     )
 
     try:
         async with httpx.AsyncClient(
             http2=True,
-            headers=INVESTING_HEADERS,
+            headers=TVC_HEADERS,
             timeout=15.0,
             follow_redirects=True
         ) as client:
-            # Hit the chart page first to get cookies
-            await client.get(
-                "https://in.investing.com/indices/gift-nifty-50-c1-futures-chart"
-            )
-            await asyncio.sleep(0.5)
-
             r = await client.get(url)
-            log.info(f"Gift Nifty API status: {r.status_code}")
+            log.info(f"Gift Nifty tvc6 status: {r.status_code} url:{url[:80]}")
 
             if r.status_code != 200:
-                log.error(f"Gift Nifty API error: {r.status_code} {r.text[:200]}")
+                log.error(f"Gift Nifty tvc6 error: {r.status_code}")
                 return []
 
-            data = r.json()
+            d = r.json()
+            # tvc6 returns {s:"ok", t:[timestamps], c:[close], o:[open], h:[high], l:[low], v:[volume]}
+            if d.get("s") != "ok":
+                log.error(f"Gift Nifty tvc6 bad status: {d.get('s')}")
+                return []
 
-            # investing.com returns {"data": [[timestamp_ms, close, open, high, low, volume], ...]}
-            candles = data.get("data", [])
+            timestamps = d.get("t", [])
+            opens      = d.get("o", [])
+            highs      = d.get("h", [])
+            lows       = d.get("l", [])
+            closes     = d.get("c", [])
+            volumes    = d.get("v", [])
+
             result = []
-            for c in candles:
-                if len(c) >= 5:
-                    ts   = int(c[0]) // 1000  # ms → seconds
-                    close = float(c[1])
-                    open_ = float(c[2])
-                    high  = float(c[3])
-                    low   = float(c[4])
-                    vol   = float(c[5]) if len(c) > 5 else 0
-                    result.append({
-                        "time":   ts,
-                        "open":   open_,
-                        "high":   high,
-                        "low":    low,
-                        "close":  close,
-                        "volume": vol,
-                    })
+            for i in range(len(timestamps)):
+                result.append({
+                    "time":   int(timestamps[i]),
+                    "open":   round(float(opens[i]),   2),
+                    "high":   round(float(highs[i]),   2),
+                    "low":    round(float(lows[i]),    2),
+                    "close":  round(float(closes[i]),  2),
+                    "volume": round(float(volumes[i]), 2) if i < len(volumes) else 0,
+                })
 
-            log.info(f"✅ Gift Nifty: {len(result)} candles fetched")
+            log.info(f"✅ Gift Nifty: {len(result)} candles")
             return result
 
     except Exception as e:
@@ -461,16 +463,12 @@ async def fetch_gift_nifty_ohlc(resolution: str = "5", bars: int = 200) -> list:
 
 
 @app.get("/api/giftnifty")
-async def get_gift_nifty(resolution: str = "5", bars: int = 200):
-    """
-    Gift Nifty OHLC data for lightweight-charts.
-    ?resolution=1|5|15|30|60|D
-    ?bars=100-500
-    """
-    data = await fetch_gift_nifty_ohlc(resolution, bars)
+async def get_gift_nifty(resolution: str = "5", bars: int = "200"):
+    """Gift Nifty OHLC for lightweight-charts. ?resolution=1|5|15|30|60|D"""
+    data = await fetch_gift_nifty_ohlc(resolution, int(bars))
     return JSONResponse({
         "symbol":     "Gift Nifty 50 Futures",
-        "pair_id":    GIFT_NIFTY_PAIR_ID,
+        "pair_id":    GIFT_NIFTY_ID,
         "resolution": resolution,
         "bars":       len(data),
         "data":       data,
