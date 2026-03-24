@@ -375,95 +375,90 @@ def health():
     }
 
 
-# ── GIFT NIFTY — investing.com tvc6 API (confirmed working) ──────────────────
-# tvc6.investing.com is the working endpoint — old api.investing.com returns 403
-# Pair ID 2283114 = Gift Nifty 50 Futures (GIFc1)
-GIFT_NIFTY_ID = "2283114"
+# ── GIFT NIFTY — using investiny package (confirmed working) ─────────────────
+# investiny uses tvc6.investing.com correctly — handles URL hash + headers
+# pip install investiny  (add to requirements.txt)
+# Gift Nifty 50 Futures investing.com ID = 2283114
+
+GIFT_NIFTY_ID = 2283114
 
 INTERVAL_MAP = {
-    "1":  1,
-    "5":  5,
-    "15": 15,
-    "30": 30,
-    "60": 60,
-    "D":  "1D",
-}
-
-TVC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://in.investing.com",
-    "Referer": "https://in.investing.com/",
+    "1":  "1",
+    "5":  "5",
+    "15": "15",
+    "30": "30",
+    "60": "60",
+    "D":  "D",
 }
 
 async def fetch_gift_nifty_ohlc(resolution: str = "5", bars: int = 200) -> list:
     """
-    Fetch Gift Nifty OHLC from tvc6.investing.com — confirmed working endpoint.
-    Returns list of {time, open, high, low, close, volume} for lightweight-charts.
+    Fetch Gift Nifty OHLC using investiny package.
+    investiny uses tvc6.investing.com — confirmed working on cloud servers.
     """
-    import time as time_module
-    interval = INTERVAL_MAP.get(resolution, 5)
-    now = int(time_module.time())
-    # Go back enough bars worth of seconds
-    seconds_per_bar = 60 if resolution == "D" else int(resolution) * 60
-    from_ts = now - (bars * seconds_per_bar * 2)
-
-    url = (
-        f"https://tvc6.investing.com/c7e949cd90d5b9cd9fd38de6c4cbf22c"
-        f"/1/{now}/1/{interval}/history"
-        f"?symbol={GIFT_NIFTY_ID}&resolution={interval}"
-        f"&from={from_ts}&to={now}"
-    )
-
     try:
-        async with httpx.AsyncClient(
-            http2=True,
-            headers=TVC_HEADERS,
-            timeout=15.0,
-            follow_redirects=True
-        ) as client:
-            r = await client.get(url)
-            log.info(f"Gift Nifty tvc6 status: {r.status_code} url:{url[:80]}")
+        from investiny import historical_data
+        from datetime import datetime, timedelta
+        import asyncio
 
-            if r.status_code != 200:
-                log.error(f"Gift Nifty tvc6 error: {r.status_code}")
-                return []
+        # Calculate date range — go back enough to get required bars
+        minutes_per_bar = {"1":1,"5":5,"15":15,"30":30,"60":60,"D":1440}.get(resolution, 5)
+        days_needed = max(3, (bars * minutes_per_bar) // (6 * 60) + 2)
+        to_date   = datetime.now()
+        from_date = to_date - timedelta(days=days_needed)
 
-            d = r.json()
-            # tvc6 returns {s:"ok", t:[timestamps], c:[close], o:[open], h:[high], l:[low], v:[volume]}
-            if d.get("s") != "ok":
-                log.error(f"Gift Nifty tvc6 bad status: {d.get('s')}")
-                return []
+        from_str = from_date.strftime("%m/%d/%Y")
+        to_str   = to_date.strftime("%m/%d/%Y")
 
-            timestamps = d.get("t", [])
-            opens      = d.get("o", [])
-            highs      = d.get("h", [])
-            lows       = d.get("l", [])
-            closes     = d.get("c", [])
-            volumes    = d.get("v", [])
+        # Run in thread pool since investiny uses sync requests
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None,
+            lambda: historical_data(
+                investing_id=GIFT_NIFTY_ID,
+                from_date=from_str,
+                to_date=to_str,
+                interval=INTERVAL_MAP.get(resolution, "5")
+            )
+        )
 
-            result = []
-            for i in range(len(timestamps)):
-                result.append({
-                    "time":   int(timestamps[i]),
-                    "open":   round(float(opens[i]),   2),
-                    "high":   round(float(highs[i]),   2),
-                    "low":    round(float(lows[i]),    2),
-                    "close":  round(float(closes[i]),  2),
-                    "volume": round(float(volumes[i]), 2) if i < len(volumes) else 0,
-                })
+        # investiny returns {"Open":[], "High":[], "Low":[], "Close":[], "Volume":[], "Date":[]}
+        dates  = raw.get("Date",   [])
+        opens  = raw.get("Open",   [])
+        highs  = raw.get("High",   [])
+        lows   = raw.get("Low",    [])
+        closes = raw.get("Close",  [])
+        vols   = raw.get("Volume", [])
 
-            log.info(f"✅ Gift Nifty: {len(result)} candles")
-            return result
+        result = []
+        for i in range(len(dates)):
+            try:
+                # Parse date to timestamp
+                dt = datetime.strptime(str(dates[i])[:19], "%Y-%m-%d %H:%M:%S")
+                ts = int(dt.timestamp())
+            except:
+                ts = i
+            result.append({
+                "time":   ts,
+                "open":   round(float(opens[i]),  2),
+                "high":   round(float(highs[i]),  2),
+                "low":    round(float(lows[i]),   2),
+                "close":  round(float(closes[i]), 2),
+                "volume": round(float(vols[i]),   2) if i < len(vols) else 0,
+            })
+
+        # Sort by time ascending (required by lightweight-charts)
+        result.sort(key=lambda x: x["time"])
+        log.info(f"✅ Gift Nifty via investiny: {len(result)} candles")
+        return result[-bars:]  # Return last N bars
 
     except Exception as e:
-        log.error(f"❌ Gift Nifty fetch failed: {e}")
+        log.error(f"❌ Gift Nifty investiny failed: {e}")
         return []
 
 
 @app.get("/api/giftnifty")
-async def get_gift_nifty(resolution: str = "5", bars: int = "200"):
+async def get_gift_nifty(resolution: str = "5", bars: int = 200):
     """Gift Nifty OHLC for lightweight-charts. ?resolution=1|5|15|30|60|D"""
     data = await fetch_gift_nifty_ohlc(resolution, int(bars))
     return JSONResponse({
