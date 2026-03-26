@@ -72,130 +72,76 @@ async def get_nse_session() -> httpx.AsyncClient:
         log.warning(f"NSE session init: {e}")
     return client
 
+async def yahoo_quote(client: httpx.AsyncClient, symbol: str) -> dict:
+    """Fetch a single quote from Yahoo Finance. Works on all cloud servers."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+        r   = await client.get(url, timeout=10)
+        txt = r.text.strip()
+        if not txt: return {}
+        d   = r.json()
+        res = d.get("chart", {}).get("result", [])
+        if not res: return {}
+        meta = res[0].get("meta", {})
+        price = float(meta.get("regularMarketPrice", 0))
+        prev  = float(meta.get("chartPreviousClose", meta.get("previousClose", price)))
+        ch    = round(price - prev, 2)
+        pch   = round((ch / prev * 100) if prev else 0, 2)
+        return {"price": round(price, 2), "change": ch, "pchange": pch, "prev": round(prev, 2)}
+    except Exception as e:
+        log.error(f"Yahoo {symbol}: {e}")
+        return {}
+
+
 async def fetch_nse_indices() -> dict:
+    """Fetch Indian indices via Yahoo Finance — works on all cloud servers."""
     result = {}
-    try:
-        client = await get_nse_session()
-        try:
-            r = await client.get(
-                "https://www.nseindia.com/api/allIndices",
-                headers={**NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"}
-            )
-            data = r.json().get("data", [])
-        finally:
-            await client.aclose()
-
-        INDEX_MAP = {
-            "NIFTY 50":          "nifty50",
-            "NIFTY BANK":        "banknifty",
-            "NIFTY IT":          "niftyit",
-            "NIFTY MIDCAP 100":  "midcap100",
-            "NIFTY NEXT 50":     "niftynext50",
-            "NIFTY PHARMA":      "niftypharma",
-            "NIFTY AUTO":        "niftyauto",
-            "INDIA VIX":         "indiavix",
-        }
-        for item in data:
-            key = INDEX_MAP.get(item.get("index", ""))
-            if key:
-                result[key] = {
-                    "price":   round(float(item.get("last", 0)), 2),
-                    "change":  round(float(item.get("change", 0)), 2),
-                    "pchange": round(float(item.get("percentChange", 0)), 2),
-                    "open":    round(float(item.get("open", 0)), 2),
-                    "high":    round(float(item.get("yearHigh", 0)), 2),
-                    "low":     round(float(item.get("yearLow", 0)), 2),
-                    "prev":    round(float(item.get("previousClose", 0)), 2),
-                }
-        log.info(f"✅ NSE indices fetched: {list(result.keys())}")
-
-    except Exception as e:
-        log.error(f"❌ NSE fetch failed: {e}")
-
-    # Sensex via BSE
-    try:
-        async with httpx.AsyncClient(http2=True, timeout=10) as client:
-            r = await client.get("https://api.bseindia.com/BseIndiaAPI/api/GetSensexData/w")
-            txt = r.text.strip()
-            if not txt: raise Exception("Empty response from BSE")
-            d = r.json()
-            price = float(d.get("CurrValue", 0))
-            prev  = float(d.get("PrevClose", price))
-            ch    = round(price - prev, 2)
-            pch   = round((ch / prev * 100) if prev else 0, 2)
-            result["sensex"] = {
-                "price": round(price, 2), "change": ch,
-                "pchange": pch, "prev": round(prev, 2),
-            }
-            log.info(f"✅ Sensex: {price}")
-    except Exception as e:
-        log.error(f"❌ Sensex fetch failed: {e}")
-
+    symbol_map = {
+        "^NSEI":    "nifty50",
+        "^NSEBANK": "banknifty",
+        "^CNXIT":   "niftyit",
+        "^NSMIDCP": "midcap100",
+        "^INDIAVIX":"indiavix",
+        "^BSESN":   "sensex",
+    }
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15, follow_redirects=True
+    ) as client:
+        for sym, key in symbol_map.items():
+            q = await yahoo_quote(client, sym)
+            if q:
+                result[key] = q
+                log.info(f"✅ {key}: {q['price']}")
+            await asyncio.sleep(0.3)
     return result
 
 
 async def fetch_metals() -> dict:
+    """Fetch metals via Yahoo Finance — free, no quota, works on Render."""
     result = {}
-    async with httpx.AsyncClient(timeout=10) as client:
+    symbol_map = {
+        "GC=F":  "gold_usd",
+        "SI=F":  "silver_usd",
+        "HG=F":  "copper_usd",
+        "ALI=F": "aluminium_usd",
+        "ZNC=F": "zinc_usd",
+        "CL=F":  "crude_usd",
+        "PL=F":  "platinum_usd",
+        "PA=F":  "palladium_usd",
+    }
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15, follow_redirects=True
+    ) as client:
+        for sym, key in symbol_map.items():
+            q = await yahoo_quote(client, sym)
+            if q:
+                result[key] = q
+                log.info(f"✅ {key}: {q['price']}")
+            await asyncio.sleep(0.3)
 
-        # Gold
-        try:
-            r = await client.get("https://www.gold-api.com/price/XAU", timeout=10)
-            txt = r.text.strip()
-            if not txt: raise Exception("Empty response")
-            d = r.json()
-            result["gold_usd"] = {
-                "price":   round(float(d.get("price", 0)), 2),
-                "pchange": round(float(d.get("chp", 0)), 2),
-                "change":  round(float(d.get("ch", 0)), 2),
-            }
-            log.info(f"✅ Gold: {result['gold_usd']['price']}")
-        except Exception as e:
-            log.error(f"❌ Gold fetch: {e}")
-
-        # Silver
-        try:
-            r = await client.get("https://www.gold-api.com/price/XAG", timeout=10)
-            txt = r.text.strip()
-            if not txt: raise Exception("Empty response")
-            d = r.json()
-            result["silver_usd"] = {
-                "price":   round(float(d.get("price", 0)), 2),
-                "pchange": round(float(d.get("chp", 0)), 2),
-                "change":  round(float(d.get("ch", 0)), 2),
-            }
-            log.info(f"✅ Silver: {result['silver_usd']['price']}")
-        except Exception as e:
-            log.error(f"❌ Silver fetch: {e}")
-
-        # Base metals from metals.dev
-        if METALS_KEY:
-            try:
-                r = await client.get(
-                    f"https://api.metals.dev/v1/latest?api_key={METALS_KEY}&currency=USD&unit=toz"
-                )
-                d = r.json().get("metals", {})
-                metal_map = {
-                    "copper":    "copper_usd",
-                    "aluminum":  "aluminium_usd",
-                    "zinc":      "zinc_usd",
-                    "nickel":    "nickel_usd",
-                    "platinum":  "platinum_usd",
-                    "palladium": "palladium_usd",
-                    "lead":      "lead_usd",
-                }
-                for src, dst in metal_map.items():
-                    if src in d:
-                        result[dst] = {"price": round(float(d[src]), 4), "pchange": 0, "source": "metals.dev"}
-                if "gold" in d and "gold_usd" not in result:
-                    result["gold_usd"] = {"price": round(float(d["gold"]), 2), "pchange": 0}
-                if "silver" in d and "silver_usd" not in result:
-                    result["silver_usd"] = {"price": round(float(d["silver"]), 4), "pchange": 0}
-                log.info(f"✅ metals.dev: {list(result.keys())}")
-            except Exception as e:
-                log.error(f"❌ metals.dev: {e}")
-
-        # Crude Oil via Finnhub
+        # Also get Nickel and Lead from Finnhub if available
         if FINNHUB_KEY:
             try:
                 r = await client.get(
@@ -203,15 +149,17 @@ async def fetch_metals() -> dict:
                 )
                 d = r.json()
                 if d.get("c"):
-                    result["crude_usd"] = {
-                        "price":   round(float(d["c"]), 2),
-                        "pchange": round(float(d.get("dp", 0)), 2),
-                        "high":    round(float(d.get("h", 0)), 2),
-                        "low":     round(float(d.get("l", 0)), 2),
-                    }
-                    log.info(f"✅ Crude: {result['crude_usd']['price']}")
+                    # Use Finnhub crude as backup if Yahoo failed
+                    if "crude_usd" not in result:
+                        result["crude_usd"] = {
+                            "price":   round(float(d["c"]), 2),
+                            "pchange": round(float(d.get("dp", 0)), 2),
+                            "change":  round(float(d.get("d", 0)), 2),
+                            "prev":    round(float(d.get("pc", 0)), 2),
+                        }
+                        log.info(f"✅ Crude (Finnhub): {result['crude_usd']['price']}")
             except Exception as e:
-                log.error(f"❌ Crude fetch: {e}")
+                log.error(f"❌ Finnhub crude: {e}")
 
     return result
 
