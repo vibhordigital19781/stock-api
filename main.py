@@ -75,12 +75,15 @@ async def get_nse_session() -> httpx.AsyncClient:
 async def fetch_nse_indices() -> dict:
     result = {}
     try:
-        async with await get_nse_session() as client:
+        client = await get_nse_session()
+        try:
             r = await client.get(
                 "https://www.nseindia.com/api/allIndices",
                 headers={**NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"}
             )
             data = r.json().get("data", [])
+        finally:
+            await client.aclose()
 
         INDEX_MAP = {
             "NIFTY 50":          "nifty50",
@@ -113,6 +116,8 @@ async def fetch_nse_indices() -> dict:
     try:
         async with httpx.AsyncClient(http2=True, timeout=10) as client:
             r = await client.get("https://api.bseindia.com/BseIndiaAPI/api/GetSensexData/w")
+            txt = r.text.strip()
+            if not txt: raise Exception("Empty response from BSE")
             d = r.json()
             price = float(d.get("CurrValue", 0))
             prev  = float(d.get("PrevClose", price))
@@ -135,7 +140,9 @@ async def fetch_metals() -> dict:
 
         # Gold
         try:
-            r = await client.get("https://www.gold-api.com/price/XAU")
+            r = await client.get("https://www.gold-api.com/price/XAU", timeout=10)
+            txt = r.text.strip()
+            if not txt: raise Exception("Empty response")
             d = r.json()
             result["gold_usd"] = {
                 "price":   round(float(d.get("price", 0)), 2),
@@ -148,7 +155,9 @@ async def fetch_metals() -> dict:
 
         # Silver
         try:
-            r = await client.get("https://www.gold-api.com/price/XAG")
+            r = await client.get("https://www.gold-api.com/price/XAG", timeout=10)
+            txt = r.text.strip()
+            if not txt: raise Exception("Empty response")
             d = r.json()
             result["silver_usd"] = {
                 "price":   round(float(d.get("price", 0)), 2),
