@@ -217,14 +217,18 @@ async def fetch_us_markets() -> dict:
 async def fetch_news() -> list:
     feeds = [
         "https://economictimes.indiatimes.com/markets/rss.cms",
+        "https://economictimes.indiatimes.com/markets/stocks/rss.cms",
+        "https://economictimes.indiatimes.com/markets/commodities/rss.cms",
         "https://www.moneycontrol.com/rss/latestnews.xml",
         "https://www.business-standard.com/rss/markets-106.rss",
+        "https://www.business-standard.com/rss/economy-policy-101.rss",
+        "https://tradingeconomics.com/rss/news.aspx",
     ]
     items = []
     for url in feeds:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:5]:
+            for e in feed.entries[:8]:
                 items.append({
                     "title":  e.get("title", ""),
                     "link":   e.get("link", ""),
@@ -233,7 +237,7 @@ async def fetch_news() -> list:
                 })
         except Exception as e:
             log.error(f"RSS {url}: {e}")
-    return items[:20]
+    return items[:40]
 
 
 async def fetch_gift_nifty() -> dict:
