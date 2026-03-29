@@ -1,5 +1,5 @@
 """
-Bazaar Watch — Backend API v5.5 (STABLE)
+Bazaar Watch — Backend API v5.6 (STABLE)
 =========================================
 Stability features:
   - Every fetch has retry logic (3 attempts)
@@ -145,14 +145,15 @@ async def fetch_metals() -> dict:
     """
     result = {}
     symbol_map = {
-        "GC=F":  "gold_usd",
-        "SI=F":  "silver_usd",
-        "HG=F":  "copper_usd",
-        "ALI=F": "aluminium_usd",
-        "ZNC=F": "zinc_usd",
-        "PL=F":  "platinum_usd",
-        "CL=F":  "crude_usd",
-        "NG=F":  "natgas_usd",
+        "GC=F":  "gold_usd",       # COMEX Gold $/oz
+        "SI=F":  "silver_usd",     # COMEX Silver $/oz
+        "HG=F":  "copper_usd",     # COMEX Copper $/lb
+        "ALI=F": "aluminium_usd",  # Aluminium $/lb
+        "ZNC=F": "zinc_usd",       # Zinc cents/lb
+        "NI=F":  "nickel_usd",     # LME Nickel $/t
+        "PL=F":  "platinum_usd",   # Platinum $/oz
+        "CL=F":  "crude_usd",      # WTI Crude $/bbl
+        "NG=F":  "natgas_usd",     # Natural Gas $/mmBtu
     }
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=15, follow_redirects=True) as client:
         for sym, key in symbol_map.items():
@@ -162,80 +163,35 @@ async def fetch_metals() -> dict:
                 log.info(f"✅ {key}: {q['price']}")
             await asyncio.sleep(0.4)
 
-        # Nickel via Finnhub (Yahoo doesn't have NI=F)
-        if FINNHUB_KEY:
-            try:
-                r = await client.get(
-                    f"https://finnhub.io/api/v1/quote?symbol=OANDA:XNIXUSD&token={FINNHUB_KEY}",
-                    timeout=8
-                )
-                d = r.json()
-                if d.get("c"):
-                    result["nickel_usd"] = {
-                        "price":   round(float(d["c"]), 2),
-                        "pchange": round(float(d.get("dp", 0)), 2),
-                        "change":  round(float(d.get("d", 0)), 2),
-                        "prev":    round(float(d.get("pc", 0)), 2),
-                    }
-                    log.info(f"✅ Nickel: {result['nickel_usd']['price']}")
-            except Exception as e:
-                log.warning(f"Nickel Finnhub: {e}")
+        # Nickel now fetched via NI=F above — Finnhub fallback removed
 
     return result
 
 
 async def fetch_us_markets() -> dict:
-    """US markets via Finnhub. DIA/SPY/QQQ are ETF proxies for indices."""
+    """
+    US indices via Yahoo Finance — real indices, not ETF proxies.
+    ^DJI = Dow Jones Industrial Average
+    ^GSPC = S&P 500
+    ^IXIC = Nasdaq Composite
+    DX-Y.NYB = US Dollar Index (ICE)
+    ^VIX = CBOE Volatility Index
+    """
     result = {}
-    if not FINNHUB_KEY:
-        return result
-
-    symbols = {"DIA": "dow", "SPY": "sp500", "QQQ": "nasdaq"}
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        for sym, key in symbols.items():
-            for attempt in range(2):
-                try:
-                    r = await client.get(
-                        f"https://finnhub.io/api/v1/quote?symbol={sym}&token={FINNHUB_KEY}"
-                    )
-                    d = r.json()
-                    if d.get("c"):
-                        result[key] = {
-                            "price":   round(float(d["c"]), 2),
-                            "pchange": round(float(d.get("dp", 0)), 2),
-                            "change":  round(float(d.get("d", 0)), 2),
-                            "high":    round(float(d.get("h", 0)), 2),
-                            "low":     round(float(d.get("l", 0)), 2),
-                        }
-                        log.info(f"✅ {sym}: {result[key]['price']}")
-                        break
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    if attempt == 1:
-                        log.warning(f"Finnhub {sym}: {e}")
-            await asyncio.sleep(0.2)
-
-        # Dollar Index
-        for attempt in range(2):
-            try:
-                r = await client.get(
-                    f"https://finnhub.io/api/v1/quote?symbol=OANDA:USD_IDX&token={FINNHUB_KEY}"
-                )
-                d = r.json()
-                if d.get("c"):
-                    result["dxy"] = {
-                        "price":   round(float(d["c"]), 3),
-                        "pchange": round(float(d.get("dp", 0)), 2),
-                        "change":  round(float(d.get("d", 0)), 2),
-                    }
-                    log.info(f"✅ DXY: {result['dxy']['price']}")
-                break
-            except Exception as e:
-                if attempt == 1:
-                    log.warning(f"DXY: {e}")
-                await asyncio.sleep(0.5)
-
+    symbol_map = {
+        "^DJI":     "dow",
+        "^GSPC":    "sp500",
+        "^IXIC":    "nasdaq",
+        "DX-Y.NYB": "dxy",
+        "^VIX":     "vix_us",
+    }
+    async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=15, follow_redirects=True) as client:
+        for sym, key in symbol_map.items():
+            q = await yahoo_quote(client, sym)
+            if q:
+                result[key] = q
+                log.info(f"✅ {key} ({sym}): {q['price']}")
+            await asyncio.sleep(0.3)
     return result
 
 
@@ -429,7 +385,7 @@ async def startup():
 @app.get("/")
 def root():
     ages = {k: round(time.time()-v["ts"]) if v["ts"] else None for k,v in cache.items()}
-    return {"status": "Bazaar Watch API v5.5", "time": datetime.now().isoformat(), "cache_ages": ages}
+    return {"status": "Bazaar Watch API v5.6", "time": datetime.now().isoformat(), "cache_ages": ages}
 
 
 @app.get("/api/all")
@@ -484,7 +440,7 @@ def health():
     now = time.time()
     return {
         "status":        "ok",
-        "version":       "5.5",
+        "version":       "5.6",
         "finnhub_key":   "set" if FINNHUB_KEY   else "missing",
         "deepseek_key":  "set" if DEEPSEEK_KEY  else "not configured",
         "gift_proxy":    GIFT_NIFTY_PROXY,
