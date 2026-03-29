@@ -242,12 +242,15 @@ async def fetch_us_markets() -> dict:
 async def fetch_news() -> list:
     """RSS news from multiple Indian financial sources."""
     feeds = [
-        ("https://economictimes.indiatimes.com/markets/rss.cms",            "ET Markets"),
-        ("https://economictimes.indiatimes.com/markets/stocks/rss.cms",     "ET Stocks"),
-        ("https://economictimes.indiatimes.com/markets/commodities/rss.cms","ET Commodities"),
-        ("https://www.moneycontrol.com/rss/latestnews.xml",                 "Moneycontrol"),
-        ("https://www.business-standard.com/rss/markets-106.rss",           "Business Standard"),
-        ("https://www.business-standard.com/rss/economy-policy-101.rss",    "BS Economy"),
+        # Indian economic & market news — no recommendations
+        ("https://economictimes.indiatimes.com/markets/rss.cms",              "ET Markets"),
+        ("https://economictimes.indiatimes.com/markets/commodities/rss.cms",  "ET Commodities"),
+        ("https://economictimes.indiatimes.com/economy/rss.cms",              "ET Economy"),
+        ("https://economictimes.indiatimes.com/markets/stocks/rss.cms",       "ET Stocks"),
+        ("https://www.business-standard.com/rss/markets-106.rss",             "Business Standard"),
+        ("https://www.business-standard.com/rss/economy-policy-101.rss",      "BS Economy"),
+        ("https://www.business-standard.com/rss/finance-100.rss",             "BS Finance"),
+        ("https://www.moneycontrol.com/rss/economy.xml",                      "Moneycontrol Economy"),
     ]
     items = []
     for url, source_name in feeds:
