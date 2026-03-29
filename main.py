@@ -139,7 +139,6 @@ async def fetch_metals() -> dict:
     HG=F  Copper   $/lb
     ALI=F Aluminium $/lb
     ZNC=F Zinc     cents/lb
-    NI=F  Nickel   (not on Yahoo) — skip
     PL=F  Platinum $/oz
     CL=F  Crude WTI $/bbl
     NG=F  Natural Gas $/mmBtu
@@ -151,7 +150,6 @@ async def fetch_metals() -> dict:
         "HG=F":  "copper_usd",     # COMEX Copper $/lb
         "ALI=F": "aluminium_usd",  # Aluminium $/lb
         "ZNC=F": "zinc_usd",       # Zinc cents/lb
-        "NI=F":  "nickel_usd",     # LME Nickel $/t
         "PL=F":  "platinum_usd",   # Platinum $/oz
         "CL=F":  "crude_usd",      # WTI Crude $/bbl
         "NG=F":  "natgas_usd",     # Natural Gas $/mmBtu
@@ -164,7 +162,24 @@ async def fetch_metals() -> dict:
                 log.info(f"✅ {key}: {q['price']}")
             await asyncio.sleep(0.4)
 
-        # Nickel now fetched via NI=F above — Finnhub fallback removed
+        # Nickel via Finnhub (Yahoo NI=F doesn't exist)
+        if FINNHUB_KEY:
+            try:
+                r = await client.get(
+                    f"https://finnhub.io/api/v1/quote?symbol=OANDA:XNIXUSD&token={FINNHUB_KEY}",
+                    timeout=8
+                )
+                d = r.json()
+                if d.get("c") and float(d["c"]) > 0:
+                    result["nickel_usd"] = {
+                        "price":   round(float(d["c"]), 2),
+                        "pchange": round(float(d.get("dp", 0)), 2),
+                        "change":  round(float(d.get("d", 0)), 2),
+                        "prev":    round(float(d.get("pc", 0)), 2),
+                    }
+                    log.info(f"✅ Nickel (Finnhub): {result['nickel_usd']['price']}")
+            except Exception as e:
+                log.warning(f"Nickel Finnhub: {e}")
 
     return result
 
