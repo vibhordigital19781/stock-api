@@ -214,15 +214,19 @@ async def fetch_us_markets() -> dict:
 async def fetch_news() -> list:
     """RSS news from multiple Indian financial sources."""
     feeds = [
-        # Indian economic & market news — no recommendations
+        # ── Indian markets & economy ──
         ("https://economictimes.indiatimes.com/markets/rss.cms",              "ET Markets"),
         ("https://economictimes.indiatimes.com/markets/commodities/rss.cms",  "ET Commodities"),
         ("https://economictimes.indiatimes.com/economy/rss.cms",              "ET Economy"),
         ("https://economictimes.indiatimes.com/markets/stocks/rss.cms",       "ET Stocks"),
         ("https://www.business-standard.com/rss/markets-106.rss",             "Business Standard"),
         ("https://www.business-standard.com/rss/economy-policy-101.rss",      "BS Economy"),
-        ("https://www.business-standard.com/rss/finance-100.rss",             "BS Finance"),
-        ("https://www.moneycontrol.com/rss/economy.xml",                      "Moneycontrol Economy"),
+        ("https://www.moneycontrol.com/rss/economy.xml",                      "Moneycontrol"),
+        # ── Global macro & sentiment ──
+        ("https://feeds.reuters.com/reuters/businessNews",                    "Reuters Business"),
+        ("https://feeds.bloomberg.com/markets/news.rss",                      "Bloomberg Markets"),
+        ("https://www.investing.com/rss/news_25.rss",                         "Investing.com"),
+        ("https://feeds.a.dj.com/rss/RSSMarketsMain.xml",                     "WSJ Markets"),
     ]
     items = []
     for url, source_name in feeds:
@@ -241,7 +245,7 @@ async def fetch_news() -> list:
         except Exception as e:
             log.warning(f"RSS {source_name}: {e}")
     # Sort by time if possible, return up to 40
-    return items[:40]
+    return items[:50]
 
 
 async def fetch_gift_nifty() -> dict:
