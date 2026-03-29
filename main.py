@@ -56,6 +56,7 @@ cache = {
     "giftnifty":     {"data": {}, "ts": 0},
     "giftbanknifty": {"data": {}, "ts": 0},
     "summary":       {"data": {}, "ts": 0},
+    "heatmap":       {"data": [], "ts": 0},
 }
 
 # ── YAHOO FINANCE — core data fetcher ────────────────────────────────────────
@@ -332,6 +333,194 @@ Rules: specific numbers, Nifty opening outlook, key levels, under 80 words, no d
         return {}
 
 
+
+# ── F&O HEATMAP STOCKS ────────────────────────────────────────────────────────
+# ~180 NSE/BSE F&O eligible stocks, Yahoo Finance .NS suffix
+FNO_STOCKS = [
+    # ── BANKING & FINANCE ──
+    ("HDFCBANK.NS",   "HDFC Bank",      "Banking"),
+    ("ICICIBANK.NS",  "ICICI Bank",     "Banking"),
+    ("SBIN.NS",       "SBI",            "Banking"),
+    ("KOTAKBANK.NS",  "Kotak Bank",     "Banking"),
+    ("AXISBANK.NS",   "Axis Bank",      "Banking"),
+    ("INDUSINDBK.NS", "IndusInd",       "Banking"),
+    ("BANDHANBNK.NS", "Bandhan Bk",     "Banking"),
+    ("IDFCFIRSTB.NS", "IDFC First",     "Banking"),
+    ("FEDERALBNK.NS", "Federal Bank",   "Banking"),
+    ("PNB.NS",        "PNB",            "Banking"),
+    ("BANKBARODA.NS", "Bank of Baroda", "Banking"),
+    ("CANARABANK.NS", "Canara Bank",    "Banking"),
+    ("BAJFINANCE.NS", "Bajaj Fin",      "Finance"),
+    ("BAJAJFINSV.NS", "Bajaj Finsv",    "Finance"),
+    ("SHRIRAMFIN.NS", "Shriram Fin",    "Finance"),
+    ("CHOLAFIN.NS",   "Chola Fin",      "Finance"),
+    ("MUTHOOTFIN.NS", "Muthoot Fin",    "Finance"),
+    ("M&MFIN.NS",     "M&M Fin",        "Finance"),
+    ("SBILIFE.NS",    "SBI Life",       "Insurance"),
+    ("HDFCLIFE.NS",   "HDFC Life",      "Insurance"),
+    ("ICICIGI.NS",    "ICICI Lombard",  "Insurance"),
+    ("LICI.NS",       "LIC",            "Insurance"),
+    # ── IT ──
+    ("TCS.NS",        "TCS",            "IT"),
+    ("INFY.NS",       "Infosys",        "IT"),
+    ("HCLTECH.NS",    "HCL Tech",       "IT"),
+    ("WIPRO.NS",      "Wipro",          "IT"),
+    ("TECHM.NS",      "Tech M",         "IT"),
+    ("LTIM.NS",       "LTIMindtree",    "IT"),
+    ("MPHASIS.NS",    "Mphasis",        "IT"),
+    ("COFORGE.NS",    "Coforge",        "IT"),
+    ("PERSISTENT.NS", "Persistent",     "IT"),
+    ("OFSS.NS",       "Oracle Fin",     "IT"),
+    # ── ENERGY & OIL ──
+    ("RELIANCE.NS",   "Reliance",       "Energy"),
+    ("ONGC.NS",       "ONGC",           "Energy"),
+    ("BPCL.NS",       "BPCL",           "Energy"),
+    ("IOC.NS",        "IOC",            "Energy"),
+    ("HINDPETRO.NS",  "HPCL",           "Energy"),
+    ("GAIL.NS",       "GAIL",           "Energy"),
+    ("MGL.NS",        "MGL",            "Energy"),
+    ("IGL.NS",        "IGL",            "Energy"),
+    ("PETRONET.NS",   "Petronet",       "Energy"),
+    ("ADANIGREEN.NS", "Adani Green",    "Energy"),
+    ("TATAPOWER.NS",  "Tata Power",     "Energy"),
+    # ── AUTO ──
+    ("MARUTI.NS",     "Maruti",         "Auto"),
+    ("TATAMOTORS.NS", "Tata Motors",    "Auto"),
+    ("M&M.NS",        "M&M",            "Auto"),
+    ("BAJAJ-AUTO.NS", "Bajaj Auto",     "Auto"),
+    ("HEROMOTOCO.NS", "Hero Moto",      "Auto"),
+    ("EICHERMOT.NS",  "Eicher Mot",     "Auto"),
+    ("ASHOKLEY.NS",   "Ashok Leyland",  "Auto"),
+    ("TVSMOTOR.NS",   "TVS Motor",      "Auto"),
+    ("MOTHERSON.NS",  "Motherson",      "Auto"),
+    ("BHARATFORG.NS", "Bharat Forge",   "Auto"),
+    ("APOLLOTYRE.NS", "Apollo Tyre",    "Auto"),
+    ("MRF.NS",        "MRF",            "Auto"),
+    # ── PHARMA ──
+    ("SUNPHARMA.NS",  "Sun Pharma",     "Pharma"),
+    ("DRREDDY.NS",    "Dr Reddy",       "Pharma"),
+    ("CIPLA.NS",      "Cipla",          "Pharma"),
+    ("DIVISLAB.NS",   "Divis Lab",      "Pharma"),
+    ("AUROPHARMA.NS", "Aurobindo",      "Pharma"),
+    ("LUPIN.NS",      "Lupin",          "Pharma"),
+    ("BIOCON.NS",     "Biocon",         "Pharma"),
+    ("ALKEM.NS",      "Alkem Lab",      "Pharma"),
+    ("TORNTPHARM.NS", "Torrent Pharm",  "Pharma"),
+    ("IPCALAB.NS",    "IPCA Lab",       "Pharma"),
+    # ── METALS & MINING ──
+    ("TATASTEEL.NS",  "Tata Steel",     "Metals"),
+    ("JSWSTEEL.NS",   "JSW Steel",      "Metals"),
+    ("HINDALCO.NS",   "Hindalco",       "Metals"),
+    ("VEDL.NS",       "Vedanta",        "Metals"),
+    ("COALINDIA.NS",  "Coal India",     "Metals"),
+    ("NMDC.NS",       "NMDC",           "Metals"),
+    ("SAIL.NS",       "SAIL",           "Metals"),
+    ("HINDCOPPER.NS", "Hind Copper",    "Metals"),
+    ("NATIONALUM.NS", "NALCO",          "Metals"),
+    # ── CONSUMER & FMCG ──
+    ("HINDUNILVR.NS", "HUL",            "FMCG"),
+    ("NESTLEIND.NS",  "Nestle",         "FMCG"),
+    ("BRITANNIA.NS",  "Britannia",      "FMCG"),
+    ("DABUR.NS",      "Dabur",          "FMCG"),
+    ("MARICO.NS",     "Marico",         "FMCG"),
+    ("COLPAL.NS",     "Colgate",        "FMCG"),
+    ("GODREJCP.NS",   "Godrej CP",      "FMCG"),
+    ("ITC.NS",        "ITC",            "FMCG"),
+    ("TATACONSUM.NS", "Tata Consumer",  "FMCG"),
+    ("VBL.NS",        "Varun Bev",      "FMCG"),
+    # ── INDUSTRIALS & INFRA ──
+    ("LT.NS",         "L&T",            "Industrials"),
+    ("SIEMENS.NS",    "Siemens",        "Industrials"),
+    ("ABB.NS",        "ABB",            "Industrials"),
+    ("BHEL.NS",       "BHEL",           "Industrials"),
+    ("BEL.NS",        "BEL",            "Industrials"),
+    ("HAL.NS",        "HAL",            "Industrials"),
+    ("ADANIPORTS.NS", "Adani Ports",    "Industrials"),
+    ("ADANIENT.NS",   "Adani Ent",      "Industrials"),
+    ("GMRINFRA.NS",   "GMR Infra",      "Industrials"),
+    ("IRB.NS",        "IRB Infra",      "Industrials"),
+    ("CUMMINSIND.NS", "Cummins",        "Industrials"),
+    ("THERMAX.NS",    "Thermax",        "Industrials"),
+    # ── TELECOM ──
+    ("BHARTIARTL.NS", "Airtel",         "Telecom"),
+    ("IDEA.NS",       "Vi",             "Telecom"),
+    ("INDUSTOWER.NS", "Indus Towers",   "Telecom"),
+    # ── UTILITIES ──
+    ("NTPC.NS",       "NTPC",           "Utilities"),
+    ("POWERGRID.NS",  "Power Grid",     "Utilities"),
+    ("ADANIPOWER.NS", "Adani Power",    "Utilities"),
+    ("TORNTPOWER.NS", "Torrent Power",  "Utilities"),
+    ("CESC.NS",       "CESC",           "Utilities"),
+    # ── REAL ESTATE ──
+    ("DLF.NS",        "DLF",            "Real Estate"),
+    ("GODREJPROP.NS", "Godrej Prop",    "Real Estate"),
+    ("OBEROIRLTY.NS", "Oberoi Realty",  "Real Estate"),
+    ("PRESTIGE.NS",   "Prestige",       "Real Estate"),
+    ("PHOENIXLTD.NS", "Phoenix",        "Real Estate"),
+    ("BRIGADE.NS",    "Brigade",        "Real Estate"),
+    # ── MATERIALS & CEMENT ──
+    ("ULTRACEMCO.NS", "UltraCem",       "Cement"),
+    ("GRASIM.NS",     "Grasim",         "Cement"),
+    ("SHREECEM.NS",   "Shree Cem",      "Cement"),
+    ("AMBUJACEM.NS",  "Ambuja Cem",     "Cement"),
+    ("ACC.NS",        "ACC",            "Cement"),
+    ("RAMCOCEM.NS",   "Ramco Cem",      "Cement"),
+    # ── CONSUMER DISCRETIONARY ──
+    ("TITAN.NS",      "Titan",          "Consumer"),
+    ("ASIANPAINT.NS", "Asian Paints",   "Consumer"),
+    ("PIDILITIND.NS", "Pidilite",       "Consumer"),
+    ("PAGEIND.NS",    "Page Ind",       "Consumer"),
+    ("TRENT.NS",      "Trent",          "Consumer"),
+    ("DMART.NS",      "DMart",          "Consumer"),
+    ("NYKAA.NS",      "Nykaa",          "Consumer"),
+    ("ZOMATO.NS",     "Zomato",         "Consumer"),
+    ("JUBLFOOD.NS",   "Jubilant Food",  "Consumer"),
+    ("DEVYANI.NS",    "Devyani",        "Consumer"),
+    # ── HEALTHCARE ──
+    ("APOLLOHOSP.NS", "Apollo Hosp",    "Healthcare"),
+    ("MAXHEALTH.NS",  "Max Health",     "Healthcare"),
+    ("FORTIS.NS",     "Fortis",         "Healthcare"),
+    ("METROPOLIS.NS", "Metropolis",     "Healthcare"),
+    ("LALPATHLAB.NS", "Dr Lal Path",    "Healthcare"),
+    # ── CHEMICALS ──
+    ("SRF.NS",        "SRF",            "Chemicals"),
+    ("AARTIIND.NS",   "Aarti Ind",      "Chemicals"),
+    ("NAVINFLUOR.NS", "Navin Fluor",    "Chemicals"),
+    ("DEEPAKNTR.NS",  "Deepak Nitrite", "Chemicals"),
+    ("PIIND.NS",      "PI Ind",         "Chemicals"),
+    ("UPL.NS",        "UPL",            "Chemicals"),
+    # ── EXCHANGE & CAPITAL MARKETS ──
+    ("BSE.NS",        "BSE",            "Capital Mkts"),
+    ("MCX.NS",        "MCX",            "Capital Mkts"),
+    ("CDSL.NS",       "CDSL",           "Capital Mkts"),
+    ("ANGELONE.NS",   "Angel One",      "Capital Mkts"),
+    ("ICICIPRULI.NS", "ICICI Pru Life", "Capital Mkts"),
+    # ── NEW AGE / TECH ──
+    ("PAYTM.NS",      "Paytm",          "New Age Tech"),
+    ("POLICYBZR.NS",  "PB Fintech",     "New Age Tech"),
+    ("DELHIVERY.NS",  "Delhivery",      "New Age Tech"),
+    ("IRCTC.NS",      "IRCTC",          "New Age Tech"),
+]
+
+async def fetch_heatmap_stocks() -> list:
+    """Fetch F&O stock prices for India heatmap. Runs every 5 minutes."""
+    result = []
+    async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=20, follow_redirects=True) as client:
+        for sym, name, sector in FNO_STOCKS:
+            q = await yahoo_quote(client, sym)
+            if q and q.get("price") and q.get("pchange") is not None:
+                result.append({
+                    "symbol":  sym.replace(".NS", ""),
+                    "name":    name,
+                    "sector":  sector,
+                    "price":   q["price"],
+                    "change":  round(q["change"], 2),
+                    "pchange": round(q["pchange"], 2),
+                })
+            await asyncio.sleep(0.2)
+    log.info(f"✅ Heatmap stocks: {len(result)}/{len(FNO_STOCKS)} fetched")
+    return result
+
 # ── BACKGROUND REFRESH — never clears cache on failure ────────────────────────
 async def refresh_cache():
     """
@@ -362,6 +551,13 @@ async def refresh_cache():
                 cache[key] = {"data": result, "ts": time.time()}
             else:
                 log.warning(f"⚠️ {key}: empty result, keeping cache (age: {round(time.time()-cache[key]['ts'])}s)")
+
+        # Heatmap stocks every 5 mins (many calls)
+        heatmap_age = time.time() - cache["heatmap"]["ts"] if cache["heatmap"]["ts"] else 9999
+        if heatmap_age > 300:
+            heatmap = await fetch_heatmap_stocks()
+            if heatmap:
+                cache["heatmap"] = {"data": heatmap, "ts": time.time()}
 
         # AI Summary every 30 mins
         summary_age = time.time() - cache["summary"]["ts"] if cache["summary"]["ts"] else 9999
@@ -434,6 +630,10 @@ def get_gift_bank_nifty():
 @app.get("/api/summary")
 def get_summary():
     return JSONResponse(cache["summary"]["data"])
+
+@app.get("/api/heatmap")
+def get_heatmap():
+    return JSONResponse(cache["heatmap"]["data"])
 
 @app.get("/api/health")
 def health():
