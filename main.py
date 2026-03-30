@@ -37,7 +37,7 @@ log = logging.getLogger("bazaar")
 # ── API KEYS ──────────────────────────────────────────────────────────────────
 FINNHUB_KEY      = os.getenv("FINNHUB_KEY",      "d6ubijpr01qp1k9busogd6ubijpr01qp1k9busp0")
 GIFT_NIFTY_PROXY = os.getenv("GIFT_NIFTY_PROXY", "https://proxy-gift-nifty.onrender.com")
-DEEPSEEK_KEY     = os.getenv("DEEPSEEK_KEY",     "")
+CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
 
 app = FastAPI(title="Bazaar Watch API v5.5")
 app.add_middleware(
@@ -55,7 +55,10 @@ cache = {
     "news":          {"data": [], "ts": 0},
     "giftnifty":     {"data": {}, "ts": 0},
     "giftbanknifty": {"data": {}, "ts": 0},
-    "summary":       {"data": {}, "ts": 0},
+    "summary":       {"data": {}, "ts": 0},   # main AI summary
+    "pre_market":    {"data": {}, "ts": 0},   # pre-market brief (before 9:15)
+    "hourly":        {"data": {}, "ts": 0},   # hourly market update
+    "post_market":   {"data": {}, "ts": 0},   # post-market wrap (after 15:30)
     "heatmap":       {"data": [], "ts": 0},
     "sparklines":    {"data": {}, "ts": 0},
 }
@@ -299,8 +302,8 @@ async def fetch_gift_bank_nifty() -> dict:
 
 
 async def generate_market_summary() -> dict:
-    """AI market summary via DeepSeek. Skipped gracefully if no key."""
-    if not DEEPSEEK_KEY:
+    """AI market summary via Claude Haiku. Skipped gracefully if no key."""
+    if not CLAUDE_KEY:
         return {}
     try:
         idx = cache["indices"]["data"]
@@ -335,10 +338,10 @@ Rules: specific numbers, Nifty opening outlook, key levels, under 80 words, no d
 
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
                 json={
-                    "model": "deepseek-chat",
+                    "model": "claude-haiku-4-5-20251001",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 200,
                     "temperature": 0.3,
@@ -371,6 +374,11 @@ SPARKLINE_SYMBOLS = {
     # Commodities / FX
     "gold":      "GC=F",
     "silver":    "SI=F",
+    "crude":     "CL=F",
+    "natgas":    "NG=F",
+    "copper":    "HG=F",
+    "alum":      "ALI=F",
+    "zinc":      "ZNC=F",
     "dxy":       "DX-Y.NYB",
     "usdinr":    "USDINR=X",
 }
@@ -398,6 +406,88 @@ async def fetch_sparklines() -> dict:
             except Exception as e:
                 log.warning(f"Sparkline {key}: {e}")
     return result
+
+
+# ── TIMED AI SUMMARIES ────────────────────────────────────────────────────────
+def get_market_context(cache_data: dict) -> str:
+    """Build compact market context string from cache."""
+    idx = cache_data.get("indices", {})
+    met = cache_data.get("metals", {})
+    us  = cache_data.get("us", {})
+    gn  = cache_data.get("giftnifty", {})
+    lines = []
+    if idx.get("nifty50"):    lines.append(f"Nifty50={idx['nifty50']['price']} ({idx['nifty50']['pchange']:+.2f}%)")
+    if idx.get("sensex"):     lines.append(f"Sensex={idx['sensex']['price']} ({idx['sensex']['pchange']:+.2f}%)")
+    if idx.get("banknifty"):  lines.append(f"BankNifty={idx['banknifty']['price']} ({idx['banknifty']['pchange']:+.2f}%)")
+    if idx.get("indiavix"):   lines.append(f"VIX={idx['indiavix']['price']}")
+    if gn.get("price"):       lines.append(f"GiftNifty={gn['price']} ({gn.get('changePct',0):+.2f}%)")
+    if us.get("dow"):         lines.append(f"Dow={us['dow']['price']} ({us['dow']['pchange']:+.2f}%)")
+    if us.get("sp500"):       lines.append(f"S&P500={us['sp500']['price']} ({us['sp500']['pchange']:+.2f}%)")
+    if us.get("nasdaq"):      lines.append(f"Nasdaq={us['nasdaq']['price']} ({us['nasdaq']['pchange']:+.2f}%)")
+    if us.get("dxy"):         lines.append(f"DXY={us['dxy']['price']}")
+    if met.get("gold_usd"):   lines.append(f"Gold={met['gold_usd']['price']}")
+    if met.get("crude_usd"):  lines.append(f"Crude={met['crude_usd']['price']}")
+    return " | ".join(lines)
+
+async def generate_timed_summary(summary_type: str, context: str) -> dict:
+    """Generate pre-market, hourly or post-market AI summary."""
+    prompts = {
+        "pre_market": f"""You are a sharp Indian market analyst. Based on these overnight/pre-market data points, write a crisp pre-market brief for Indian traders opening their terminals at 9:00 AM IST.
+
+Data: {context}
+
+Write in 3 short paragraphs:
+1. Overnight global cues (US markets, Asia, commodities) — 2-3 sentences
+2. What to watch at open — key levels, sectors, triggers — 2-3 sentences  
+3. One-line market bias for the day
+
+Be specific, use actual numbers. No generic filler. Max 120 words.""",
+
+        "hourly": f"""You are a live Indian market commentator. Based on current market data, write a 60-second hourly market update for traders.
+
+Data: {context}
+
+Format:
+- Market pulse: Current trend in 1 sentence
+- Movers: What's driving the move
+- Watch: Key level to watch next hour
+
+Max 80 words. Sharp and specific.""",
+
+        "post_market": f"""You are an Indian market analyst. Write a post-market closing summary for investors reviewing their day.
+
+Data: {context}
+
+Write in 3 paragraphs:
+1. Day's summary — what happened, key moves, final closes
+2. Drivers — why the market moved as it did
+3. Tomorrow's setup — what to watch overnight/next session
+
+Max 150 words. Professional tone."""
+    }
+
+    prompt = prompts.get(summary_type, prompts["hourly"])
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": CLAUDE_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 350,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+            )
+            d = r.json()
+            text = d["content"][0]["text"].strip()
+            return {"text": text, "ts": time.time(), "type": summary_type, "context": context[:200]}
+    except Exception as e:
+        log.warning(f"Timed summary {summary_type}: {e}")
+        return {}
 
 # ── F&O HEATMAP STOCKS ────────────────────────────────────────────────────────
 # ~180 NSE/BSE F&O eligible stocks, Yahoo Finance .NS suffix
@@ -634,6 +724,34 @@ async def refresh_cache():
             if heatmap:
                 cache["heatmap"] = {"data": heatmap, "ts": time.time()}
 
+        # Timed AI summaries — pre-market (7-9:15 IST), hourly (9:15-15:30), post-market (15:30-17:00)
+        from datetime import datetime, timezone, timedelta
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(ist)
+        hour, minute = now_ist.hour, now_ist.minute
+        context = get_market_context(cache)
+
+        # Pre-market: 7:00–9:15 IST, refresh every 30 mins
+        if (7 <= hour < 9 or (hour == 9 and minute < 15)):
+            pm_age = time.time() - cache["pre_market"]["ts"] if cache["pre_market"]["ts"] else 9999
+            if pm_age > 1800:
+                result = await generate_timed_summary("pre_market", context)
+                if result: cache["pre_market"] = {"data": result, "ts": time.time()}
+
+        # Hourly update: 9:15–15:30 IST, refresh every 60 mins
+        elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 30):
+            hr_age = time.time() - cache["hourly"]["ts"] if cache["hourly"]["ts"] else 9999
+            if hr_age > 3600:
+                result = await generate_timed_summary("hourly", context)
+                if result: cache["hourly"] = {"data": result, "ts": time.time()}
+
+        # Post-market: 15:30–17:00 IST, refresh every 30 mins
+        elif (hour == 15 and minute > 30) or (hour == 16):
+            po_age = time.time() - cache["post_market"]["ts"] if cache["post_market"]["ts"] else 9999
+            if po_age > 1800:
+                result = await generate_timed_summary("post_market", context)
+                if result: cache["post_market"] = {"data": result, "ts": time.time()}
+
         # AI Summary every 30 mins
         summary_age = time.time() - cache["summary"]["ts"] if cache["summary"]["ts"] else 9999
         if summary_age > 1800:
@@ -670,6 +788,9 @@ def get_all():
         "giftnifty":     cache["giftnifty"]["data"],
         "giftbanknifty": cache["giftbanknifty"]["data"],
         "summary":       cache["summary"]["data"],
+        "pre_market":    cache["pre_market"]["data"],
+        "hourly":        cache["hourly"]["data"],
+        "post_market":   cache["post_market"]["data"],
         "sparklines":    cache["sparklines"]["data"],
         "timestamp":     datetime.now().isoformat(),
         "cache_age": {
@@ -711,6 +832,18 @@ def get_summary():
 def get_heatmap():
     return JSONResponse(cache["heatmap"]["data"])
 
+@app.get("/api/pre-market")
+def get_pre_market():
+    return JSONResponse(cache["pre_market"]["data"])
+
+@app.get("/api/hourly")
+def get_hourly():
+    return JSONResponse(cache["hourly"]["data"])
+
+@app.get("/api/post-market")
+def get_post_market():
+    return JSONResponse(cache["post_market"]["data"])
+
 @app.get("/api/sparklines")
 def get_sparklines():
     return JSONResponse(cache["sparklines"]["data"])
@@ -722,7 +855,7 @@ def health():
         "status":        "ok",
         "version":       "5.6",
         "finnhub_key":   "set" if FINNHUB_KEY   else "missing",
-        "deepseek_key":  "set" if DEEPSEEK_KEY  else "not configured",
+        "claude_key":    "set" if CLAUDE_KEY    else "not configured",
         "gift_proxy":    GIFT_NIFTY_PROXY,
         "cache": {
             k: {
