@@ -57,6 +57,7 @@ cache = {
     "giftbanknifty": {"data": {}, "ts": 0},
     "summary":       {"data": {}, "ts": 0},
     "heatmap":       {"data": [], "ts": 0},
+    "sparklines":    {"data": {}, "ts": 0},
 }
 
 # ── YAHOO FINANCE — core data fetcher ────────────────────────────────────────
@@ -353,6 +354,51 @@ Rules: specific numbers, Nifty opening outlook, key levels, under 80 words, no d
 
 
 
+
+# ── SPARKLINES — hourly intraday data for key symbols ────────────────────────
+SPARKLINE_SYMBOLS = {
+    # Indian indices
+    "nifty50":   "^NSEI",
+    "sensex":    "^BSESN",
+    "banknifty": "^NSEBANK",
+    "niftyit":   "^CNXIT",
+    "midcap":    "^NSMIDCP",
+    "indiavix":  "^INDIAVIX",
+    # US markets
+    "dow":       "^DJI",
+    "sp500":     "^GSPC",
+    "nasdaq":    "^IXIC",
+    # Commodities / FX
+    "gold":      "GC=F",
+    "silver":    "SI=F",
+    "dxy":       "DX-Y.NYB",
+    "usdinr":    "USDINR=X",
+}
+
+async def fetch_sparklines() -> dict:
+    """Fetch 1-day 1-hour interval closes for sparkline charts."""
+    result = {}
+    async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=20, follow_redirects=True) as client:
+        for key, sym in SPARKLINE_SYMBOLS.items():
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1h&range=1d"
+                r   = await client.get(url, timeout=10)
+                d   = r.json()
+                res = d.get("chart", {}).get("result", [])
+                if not res:
+                    continue
+                closes = res[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                times  = res[0].get("timestamp", [])
+                # Filter out None values
+                pts = [round(v, 2) for v in closes if v is not None]
+                if len(pts) >= 2:
+                    result[key] = pts
+                    log.info(f"✅ Sparkline {key}: {len(pts)} pts")
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                log.warning(f"Sparkline {key}: {e}")
+    return result
+
 # ── F&O HEATMAP STOCKS ────────────────────────────────────────────────────────
 # ~180 NSE/BSE F&O eligible stocks, Yahoo Finance .NS suffix
 FNO_STOCKS = [
@@ -535,6 +581,9 @@ async def fetch_heatmap_stocks() -> list:
                     "price":   q["price"],
                     "change":  round(q["change"], 2),
                     "pchange": round(q["pchange"], 2),
+                    "high":    q.get("high"),
+                    "low":     q.get("low"),
+                    "prev":    q.get("prev"),
                 })
             await asyncio.sleep(0.2)
     log.info(f"✅ Heatmap stocks: {len(result)}/{len(FNO_STOCKS)} fetched")
@@ -570,6 +619,13 @@ async def refresh_cache():
                 cache[key] = {"data": result, "ts": time.time()}
             else:
                 log.warning(f"⚠️ {key}: empty result, keeping cache (age: {round(time.time()-cache[key]['ts'])}s)")
+
+        # Sparklines every 5 mins
+        spark_age = time.time() - cache["sparklines"]["ts"] if cache["sparklines"]["ts"] else 9999
+        if spark_age > 300:
+            sparklines = await fetch_sparklines()
+            if sparklines:
+                cache["sparklines"] = {"data": sparklines, "ts": time.time()}
 
         # Heatmap stocks every 5 mins (many calls)
         heatmap_age = time.time() - cache["heatmap"]["ts"] if cache["heatmap"]["ts"] else 9999
@@ -614,6 +670,7 @@ def get_all():
         "giftnifty":     cache["giftnifty"]["data"],
         "giftbanknifty": cache["giftbanknifty"]["data"],
         "summary":       cache["summary"]["data"],
+        "sparklines":    cache["sparklines"]["data"],
         "timestamp":     datetime.now().isoformat(),
         "cache_age": {
             k: round(now - v["ts"]) if v["ts"] else None
@@ -653,6 +710,10 @@ def get_summary():
 @app.get("/api/heatmap")
 def get_heatmap():
     return JSONResponse(cache["heatmap"]["data"])
+
+@app.get("/api/sparklines")
+def get_sparklines():
+    return JSONResponse(cache["sparklines"]["data"])
 
 @app.get("/api/health")
 def health():
