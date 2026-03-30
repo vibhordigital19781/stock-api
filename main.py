@@ -226,11 +226,12 @@ async def fetch_news() -> list:
         ("https://www.business-standard.com/rss/markets-106.rss",             "Business Standard"),
         ("https://www.business-standard.com/rss/economy-policy-101.rss",      "BS Economy"),
         ("https://www.moneycontrol.com/rss/economy.xml",                      "Moneycontrol"),
-        # ── Global macro & sentiment ──
+        # ── Global macro & commodities ──
         ("https://feeds.reuters.com/reuters/businessNews",                    "Reuters Business"),
-        ("https://feeds.bloomberg.com/markets/news.rss",                      "Bloomberg Markets"),
+        ("https://feeds.reuters.com/reuters/commoditiesNews",                 "Reuters Commodities"),
         ("https://www.investing.com/rss/news_25.rss",                         "Investing.com"),
         ("https://feeds.a.dj.com/rss/RSSMarketsMain.xml",                     "WSJ Markets"),
+        ("https://oilprice.com/rss/main",                                     "OilPrice.com"),
     ]
     items = []
     for url, source_name in feeds:
@@ -377,8 +378,6 @@ SPARKLINE_SYMBOLS = {
     "crude":     "CL=F",
     "natgas":    "NG=F",
     "copper":    "HG=F",
-    "alum":      "ALI=F",
-    "zinc":      "ZNC=F",
     "dxy":       "DX-Y.NYB",
     "usdinr":    "USDINR=X",
 }
