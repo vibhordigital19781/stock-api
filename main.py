@@ -38,6 +38,7 @@ log = logging.getLogger("bazaar")
 FINNHUB_KEY      = os.getenv("FINNHUB_KEY",      "d6ubijpr01qp1k9busogd6ubijpr01qp1k9busp0")
 GIFT_NIFTY_PROXY = os.getenv("GIFT_NIFTY_PROXY", "https://proxy-gift-nifty.onrender.com")
 CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
+SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY",  "")
 
 app = FastAPI(title="Bazaar Watch API v5.5")
 app.add_middleware(
@@ -680,6 +681,9 @@ async def fetch_heatmap_stocks() -> list:
     return result
 
 # ── NSE OPTION CHAIN — PCR, Max Pain, Top OI ────────────────────────────────
+# NSE blocks non-Indian IPs, so we route through Scrape.do (residential proxy).
+# Falls back to direct NSE if no SCRAPER_API_KEY is set.
+
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -691,7 +695,7 @@ _nse_cookies = {"cookies": None, "ts": 0}
 
 
 async def _get_nse_cookies(client: httpx.AsyncClient):
-    """Visit NSE homepage to get session cookies (required before API calls)."""
+    """Visit NSE homepage to get session cookies (only used for direct access)."""
     now = time.time()
     if _nse_cookies["cookies"] and (now - _nse_cookies["ts"]) < 300:
         return _nse_cookies["cookies"]
@@ -706,16 +710,42 @@ async def _get_nse_cookies(client: httpx.AsyncClient):
     return _nse_cookies["cookies"]
 
 
-async def _fetch_nse_chain(client: httpx.AsyncClient, symbol: str, cookies: dict):
-    """Fetch raw option chain JSON from NSE for one index."""
+async def _fetch_nse_chain(client: httpx.AsyncClient, symbol: str):
+    """Fetch option chain — tries Scrape.do first, then direct NSE."""
+    from urllib.parse import quote
+
+    nse_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+
+    # Method 1: Scrape.do proxy (works from any IP)
+    if SCRAPER_API_KEY:
+        try:
+            proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&super=true"
+            r = await client.get(proxy_url, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                if "records" in data:
+                    log.info(f"✅ NSE chain {symbol} via Scrape.do")
+                    return data
+                log.warning(f"NSE chain {symbol} via Scrape.do: no 'records' in response")
+            else:
+                log.warning(f"NSE chain {symbol} via Scrape.do: HTTP {r.status_code}")
+        except Exception as e:
+            log.warning(f"NSE chain {symbol} via Scrape.do: {e}")
+
+    # Method 2: Direct NSE (works if Render IP is not blocked)
     try:
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        r = await client.get(url, headers=NSE_HEADERS, cookies=cookies, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        log.warning(f"NSE chain {symbol}: HTTP {r.status_code}")
+        cookies = await _get_nse_cookies(client)
+        if cookies:
+            r = await client.get(nse_url, headers=NSE_HEADERS, cookies=cookies, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if "records" in data:
+                    log.info(f"✅ NSE chain {symbol} direct")
+                    return data
+            log.warning(f"NSE chain {symbol} direct: HTTP {r.status_code}")
     except Exception as e:
-        log.warning(f"NSE chain {symbol}: {e}")
+        log.warning(f"NSE chain {symbol} direct: {e}")
+
     return None
 
 
@@ -784,16 +814,11 @@ async def fetch_option_chain() -> dict:
     """Fetch Nifty + BankNifty option chains from NSE. Cached 3 minutes."""
     result = {}
     try:
-        async with httpx.AsyncClient() as client:
-            cookies = await _get_nse_cookies(client)
-            if not cookies:
-                log.warning("⚠️ No NSE cookies, skipping option chain")
-                return {}
-
-            # Small delay between requests to be nice to NSE
-            nifty_raw = await _fetch_nse_chain(client, "NIFTY", cookies)
-            await asyncio.sleep(1)
-            bn_raw = await _fetch_nse_chain(client, "BANKNIFTY", cookies)
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            # Fetch sequentially with delay (NSE rate limits)
+            nifty_raw = await _fetch_nse_chain(client, "NIFTY")
+            await asyncio.sleep(2)
+            bn_raw = await _fetch_nse_chain(client, "BANKNIFTY")
 
         for prefix, raw in [("nifty", nifty_raw), ("bn", bn_raw)]:
             p = _process_chain(raw)
@@ -1006,6 +1031,7 @@ def health():
         "version":       "5.6",
         "finnhub_key":   "set" if FINNHUB_KEY   else "missing",
         "claude_key":    "set" if CLAUDE_KEY    else "not configured",
+        "scraper_key":   "set" if SCRAPER_API_KEY else "missing — option chain won't work",
         "gift_proxy":    GIFT_NIFTY_PROXY,
         "cache": {
             k: {
