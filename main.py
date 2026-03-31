@@ -61,6 +61,7 @@ cache = {
     "post_market":   {"data": {}, "ts": 0},   # post-market wrap (after 15:30)
     "heatmap":       {"data": [], "ts": 0},
     "sparklines":    {"data": {}, "ts": 0},
+    "options":       {"data": {}, "ts": 0},
 }
 
 # ── YAHOO FINANCE — core data fetcher ────────────────────────────────────────
@@ -678,6 +679,144 @@ async def fetch_heatmap_stocks() -> list:
     log.info(f"✅ Heatmap stocks: {len(result)}/{len(FNO_STOCKS)} fetched")
     return result
 
+# ── NSE OPTION CHAIN — PCR, Max Pain, Top OI ────────────────────────────────
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/option-chain",
+}
+_nse_cookies = {"cookies": None, "ts": 0}
+
+
+async def _get_nse_cookies(client: httpx.AsyncClient):
+    """Visit NSE homepage to get session cookies (required before API calls)."""
+    now = time.time()
+    if _nse_cookies["cookies"] and (now - _nse_cookies["ts"]) < 300:
+        return _nse_cookies["cookies"]
+    try:
+        r = await client.get("https://www.nseindia.com", headers=NSE_HEADERS,
+                             follow_redirects=True, timeout=10)
+        _nse_cookies["cookies"] = dict(r.cookies)
+        _nse_cookies["ts"] = now
+        log.info("✅ NSE cookies refreshed")
+    except Exception as e:
+        log.warning(f"NSE cookie error: {e}")
+    return _nse_cookies["cookies"]
+
+
+async def _fetch_nse_chain(client: httpx.AsyncClient, symbol: str, cookies: dict):
+    """Fetch raw option chain JSON from NSE for one index."""
+    try:
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        r = await client.get(url, headers=NSE_HEADERS, cookies=cookies, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        log.warning(f"NSE chain {symbol}: HTTP {r.status_code}")
+    except Exception as e:
+        log.warning(f"NSE chain {symbol}: {e}")
+    return None
+
+
+def _process_chain(raw: dict) -> dict | None:
+    """Extract PCR, Max Pain, top OI strikes from raw NSE option chain."""
+    if not raw or "records" not in raw or "data" not in raw["records"]:
+        return None
+
+    records = raw["records"]
+    data = records["data"]
+
+    # Find nearest expiry
+    from datetime import datetime as dt
+    expiry_dates = sorted(
+        set(r["expiryDate"] for r in data),
+        key=lambda d: dt.strptime(d, "%d-%b-%Y")
+    )
+    if not expiry_dates:
+        return None
+    nearest = expiry_dates[0]
+    near = [r for r in data if r["expiryDate"] == nearest]
+
+    total_ce, total_pe = 0, 0
+    calls, puts = [], []
+    strike_map = {}
+
+    for row in near:
+        s = row["strikePrice"]
+        ce_oi = (row.get("CE", {}).get("openInterest", 0) or 0)
+        pe_oi = (row.get("PE", {}).get("openInterest", 0) or 0)
+        total_ce += ce_oi
+        total_pe += pe_oi
+        if ce_oi: calls.append({"strike": s, "oi": ce_oi})
+        if pe_oi: puts.append({"strike": s, "oi": pe_oi})
+        strike_map[s] = 0
+
+    # Max Pain calculation — strike where total option writer loss is minimum
+    for test_s in sorted(strike_map):
+        pain = 0
+        for row in near:
+            s = row["strikePrice"]
+            ce_oi = (row.get("CE", {}).get("openInterest", 0) or 0)
+            pe_oi = (row.get("PE", {}).get("openInterest", 0) or 0)
+            if test_s > s:
+                pain += (test_s - s) * ce_oi   # ITM calls pay out
+            if test_s < s:
+                pain += (s - test_s) * pe_oi   # ITM puts pay out
+        strike_map[test_s] = pain
+
+    maxpain = min(strike_map, key=strike_map.get) if strike_map else None
+    pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
+
+    return {
+        "pcr": pcr,
+        "maxpain": maxpain,
+        "expiry": nearest,
+        "spot": records.get("underlyingValue"),
+        "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
+        "top_put_oi":  sorted(puts,  key=lambda x: x["oi"], reverse=True)[:3],
+        "total_ce": total_ce,
+        "total_pe": total_pe,
+    }
+
+
+async def fetch_option_chain() -> dict:
+    """Fetch Nifty + BankNifty option chains from NSE. Cached 3 minutes."""
+    result = {}
+    try:
+        async with httpx.AsyncClient() as client:
+            cookies = await _get_nse_cookies(client)
+            if not cookies:
+                log.warning("⚠️ No NSE cookies, skipping option chain")
+                return {}
+
+            # Small delay between requests to be nice to NSE
+            nifty_raw = await _fetch_nse_chain(client, "NIFTY", cookies)
+            await asyncio.sleep(1)
+            bn_raw = await _fetch_nse_chain(client, "BANKNIFTY", cookies)
+
+        for prefix, raw in [("nifty", nifty_raw), ("bn", bn_raw)]:
+            p = _process_chain(raw)
+            if p:
+                result[f"{prefix}_pcr"]     = p["pcr"]
+                result[f"{prefix}_maxpain"]  = p["maxpain"]
+                result[f"{prefix}_expiry"]   = p["expiry"]
+                result[f"{prefix}_spot"]     = p["spot"]
+                result[f"{prefix}_call_oi"]  = p["top_call_oi"]
+                result[f"{prefix}_put_oi"]   = p["top_put_oi"]
+                result[f"{prefix}_total_ce"] = p["total_ce"]
+                result[f"{prefix}_total_pe"] = p["total_pe"]
+                log.info(f"✅ {prefix.upper()} options: PCR={p['pcr']}, MaxPain={p['maxpain']}, Expiry={p['expiry']}")
+
+        if result:
+            result["updated_at"] = datetime.now().isoformat()
+
+    except Exception as e:
+        log.error(f"❌ Option chain error: {e}")
+
+    return result
+
+
 # ── BACKGROUND REFRESH — never clears cache on failure ────────────────────────
 async def refresh_cache():
     """
@@ -722,6 +861,13 @@ async def refresh_cache():
             heatmap = await fetch_heatmap_stocks()
             if heatmap:
                 cache["heatmap"] = {"data": heatmap, "ts": time.time()}
+
+        # Option chain every 3 mins (NSE rate-limited)
+        opt_age = time.time() - cache["options"]["ts"] if cache["options"]["ts"] else 9999
+        if opt_age > 180:
+            options = await fetch_option_chain()
+            if options:
+                cache["options"] = {"data": options, "ts": time.time()}
 
         # Timed AI summaries — pre-market (7-9:15 IST), hourly (9:15-15:30), post-market (15:30-17:00)
         from datetime import datetime, timezone, timedelta
@@ -791,6 +937,7 @@ def get_all():
         "hourly":        cache["hourly"]["data"],
         "post_market":   cache["post_market"]["data"],
         "sparklines":    cache["sparklines"]["data"],
+        "options":       cache["options"]["data"],
         "timestamp":     datetime.now().isoformat(),
         "cache_age": {
             k: round(now - v["ts"]) if v["ts"] else None
@@ -846,6 +993,10 @@ def get_post_market():
 @app.get("/api/sparklines")
 def get_sparklines():
     return JSONResponse(cache["sparklines"]["data"])
+
+@app.get("/api/options")
+def get_options():
+    return JSONResponse(cache["options"]["data"])
 
 @app.get("/api/health")
 def health():
