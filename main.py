@@ -680,211 +680,70 @@ async def fetch_heatmap_stocks() -> list:
     log.info(f"✅ Heatmap stocks: {len(result)}/{len(FNO_STOCKS)} fetched")
     return result
 
-# ── OPTION CHAIN — Yahoo Finance (crumb auth) → NSE via Scrape.do ────────────
-# Yahoo v7 now requires crumb+cookie auth. We fetch crumb first, then use it.
-# NSE fallback uses Scrape.do with geoCode=in (Indian residential IP).
+# ── OPTION CHAIN — NSE via Scrape.do (session) → Yahoo Finance (crumb) ───────
+# NSE requires cookies from homepage visit. Scrape.do "sessionId" maintains
+# cookies across requests, allowing a 2-step flow: visit homepage → hit API.
+# Yahoo as fallback with proper crumb authentication.
 
 _yahoo_crumb = {"crumb": None, "cookies": None, "ts": 0}
 
-NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/option-chain",
-}
 
-
-# ── YAHOO FINANCE WITH CRUMB AUTH ────────────────────────────────────────────
-async def _get_yahoo_crumb(client: httpx.AsyncClient) -> tuple:
-    """Fetch Yahoo crumb + session cookies. Required for v7/v8 endpoints."""
-    now = time.time()
-    if _yahoo_crumb["crumb"] and (now - _yahoo_crumb["ts"]) < 1800:
-        return _yahoo_crumb["crumb"], _yahoo_crumb["cookies"]
-
-    try:
-        # Step 1: Visit Yahoo to get session cookies
-        r1 = await client.get("https://fc.yahoo.com", timeout=10)
-        cookies = dict(r1.cookies)
-
-        # Step 2: Fetch crumb using those cookies
-        r2 = await client.get(
-            "https://query2.finance.yahoo.com/v1/test/getcrumb",
-            cookies=cookies, timeout=10
-        )
-        if r2.status_code == 200 and r2.text.strip():
-            crumb = r2.text.strip()
-            _yahoo_crumb["crumb"] = crumb
-            _yahoo_crumb["cookies"] = cookies
-            _yahoo_crumb["ts"] = now
-            log.info(f"✅ Yahoo crumb fetched: {crumb[:8]}...")
-            return crumb, cookies
-    except Exception as e:
-        log.warning(f"Yahoo crumb error: {e}")
-
-    return None, None
-
-
-async def _fetch_yahoo_options(client: httpx.AsyncClient, symbol: str) -> dict | None:
-    """Fetch option chain from Yahoo Finance with crumb auth."""
-    crumb, cookies = await _get_yahoo_crumb(client)
-
-    for attempt in range(2):
-        try:
-            host = "query2" if attempt == 0 else "query1"
-            url = f"https://{host}.finance.yahoo.com/v7/finance/options/{symbol}"
-            params = {}
-            req_cookies = {}
-            if crumb:
-                params["crumb"] = crumb
-                req_cookies = cookies or {}
-
-            r = await client.get(url, params=params, cookies=req_cookies, timeout=15)
-            if r.status_code != 200:
-                log.warning(f"Yahoo options {symbol} attempt {attempt+1}: HTTP {r.status_code}")
-                continue
-            d = r.json()
-            result = d.get("optionChain", {}).get("result", [])
-            if not result:
-                continue
-            chain = result[0]
-            options = chain.get("options", [])
-            if not options or not options[0].get("calls"):
-                log.warning(f"Yahoo options {symbol}: no option data")
-                return None
-            log.info(f"✅ Yahoo options {symbol}: got chain")
-            return chain
-        except Exception as e:
-            if attempt == 1:
-                log.warning(f"Yahoo options {symbol}: {e}")
-    return None
-
-
-def _process_yahoo_chain(chain: dict) -> dict | None:
-    """Process Yahoo Finance option chain into PCR, Max Pain, top OI."""
-    if not chain:
-        return None
-    options = chain.get("options", [])
-    if not options:
-        return None
-
-    nearest = options[0]
-    calls_raw = nearest.get("calls", [])
-    puts_raw  = nearest.get("puts", [])
-    if not calls_raw and not puts_raw:
-        return None
-
-    exp_ts = nearest.get("expirationDate", 0)
-    from datetime import datetime as dt
-    expiry_str = dt.utcfromtimestamp(exp_ts).strftime("%d-%b-%Y") if exp_ts else "—"
-
-    total_ce, total_pe = 0, 0
-    calls, puts = [], []
-    all_rows = {}
-
-    for c in calls_raw:
-        s = c.get("strike", 0)
-        oi = c.get("openInterest", 0) or 0
-        total_ce += oi
-        if oi > 0: calls.append({"strike": s, "oi": oi})
-        if s not in all_rows: all_rows[s] = {"ce_oi": 0, "pe_oi": 0}
-        all_rows[s]["ce_oi"] = oi
-
-    for p in puts_raw:
-        s = p.get("strike", 0)
-        oi = p.get("openInterest", 0) or 0
-        total_pe += oi
-        if oi > 0: puts.append({"strike": s, "oi": oi})
-        if s not in all_rows: all_rows[s] = {"ce_oi": 0, "pe_oi": 0}
-        all_rows[s]["pe_oi"] = oi
-
-    if total_ce == 0 and total_pe == 0:
-        return None
-
-    strike_pain = {}
-    for test_s in sorted(all_rows.keys()):
-        pain = 0
-        for s, row in all_rows.items():
-            if test_s > s: pain += (test_s - s) * row["ce_oi"]
-            if test_s < s: pain += (s - test_s) * row["pe_oi"]
-        strike_pain[test_s] = pain
-
-    maxpain = min(strike_pain, key=strike_pain.get) if strike_pain else None
-    pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
-    spot = chain.get("quote", {}).get("regularMarketPrice")
-
-    return {
-        "pcr": pcr, "maxpain": maxpain, "expiry": expiry_str, "spot": spot,
-        "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
-        "top_put_oi":  sorted(puts,  key=lambda x: x["oi"], reverse=True)[:3],
-        "total_ce": total_ce, "total_pe": total_pe, "source": "yahoo",
-    }
-
-
-# ── NSE OPTION CHAIN via Scrape.do (Indian geo) ─────────────────────────────
-async def _fetch_nse_chain_via_scraper(client: httpx.AsyncClient, symbol: str):
-    """Fetch NSE option chain via Scrape.do with Indian residential IP."""
+# ── NSE via SCRAPE.DO SESSION (primary method) ──────────────────────────────
+async def _fetch_nse_via_session(client: httpx.AsyncClient, symbol: str):
+    """Two-step NSE fetch using Scrape.do sessions to maintain cookies."""
     if not SCRAPER_API_KEY:
         return None
     from urllib.parse import quote
-    nse_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    import random, string
 
-    # Try multiple Scrape.do strategies
-    strategies = [
-        # Strategy 1: Indian geo + super residential proxy
-        f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&super=true&geoCode=in",
-        # Strategy 2: Indian geo without super
-        f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&geoCode=in",
-        # Strategy 3: Custom headers to mimic browser
-        f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&customHeaders=true",
-    ]
+    sid = "nse-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    nse_home = "https://www.nseindia.com/option-chain"
+    nse_api  = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
 
-    for i, proxy_url in enumerate(strategies):
-        try:
-            headers = {}
-            if "customHeaders=true" in proxy_url:
-                headers = {
-                    "sd-Accept": "application/json",
-                    "sd-Referer": "https://www.nseindia.com/option-chain",
-                    "sd-Accept-Language": "en-US,en;q=0.9",
-                }
-            r = await client.get(proxy_url, headers=headers, timeout=35)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    if isinstance(data, dict) and "records" in data and "data" in data.get("records", {}):
-                        log.info(f"✅ NSE chain {symbol} via Scrape.do strategy {i+1}")
-                        return data
-                    log.warning(f"NSE {symbol} strategy {i+1}: 200 but no records (body: {str(data)[:100]})")
-                except:
-                    log.warning(f"NSE {symbol} strategy {i+1}: 200 but not JSON")
-            else:
-                log.warning(f"NSE {symbol} strategy {i+1}: HTTP {r.status_code}")
-        except Exception as e:
-            log.warning(f"NSE {symbol} strategy {i+1}: {e}")
+    try:
+        # Step 1: Visit NSE to set cookies in the scrape.do session
+        home_url = (f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+                    f"&url={quote(nse_home, safe='')}&sessionId={sid}")
+        r1 = await client.get(home_url, timeout=30)
+        log.info(f"NSE session step1 {symbol}: HTTP {r1.status_code} (session={sid})")
+        if r1.status_code != 200:
+            return None
 
+        await asyncio.sleep(2)
+
+        # Step 2: Hit API using same session (cookies carry over)
+        api_url = (f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+                   f"&url={quote(nse_api, safe='')}&sessionId={sid}")
+        r2 = await client.get(api_url, timeout=30)
+        log.info(f"NSE session step2 {symbol}: HTTP {r2.status_code}")
+
+        if r2.status_code == 200:
+            try:
+                data = r2.json()
+                if isinstance(data, dict) and "records" in data and "data" in data.get("records", {}):
+                    log.info(f"✅ NSE chain {symbol} via session: got {len(data['records']['data'])} records")
+                    return data
+                log.warning(f"NSE session {symbol}: 200 but body={str(data)[:150]}")
+            except Exception as e:
+                log.warning(f"NSE session {symbol}: not JSON — {r2.text[:150]}")
+    except Exception as e:
+        log.warning(f"NSE session {symbol}: {e}")
     return None
 
 
-def _process_nse_chain(raw: dict) -> dict | None:
+def _process_nse_chain(raw):
     """Process NSE option chain JSON into PCR, Max Pain, top OI."""
     if not raw or "records" not in raw or "data" not in raw["records"]:
         return None
     records = raw["records"]
     data = records["data"]
-
     from datetime import datetime as dt
-    expiry_dates = sorted(
-        set(r["expiryDate"] for r in data),
-        key=lambda d: dt.strptime(d, "%d-%b-%Y")
-    )
+    expiry_dates = sorted(set(r["expiryDate"] for r in data), key=lambda d: dt.strptime(d, "%d-%b-%Y"))
     if not expiry_dates: return None
     nearest = expiry_dates[0]
     near = [r for r in data if r["expiryDate"] == nearest]
-
     total_ce, total_pe = 0, 0
-    calls, puts = [], []
-    strike_map = {}
+    calls, puts, strike_map = [], [], {}
     for row in near:
         s = row["strikePrice"]
         ce_oi = (row.get("CE", {}).get("openInterest", 0) or 0)
@@ -893,7 +752,6 @@ def _process_nse_chain(raw: dict) -> dict | None:
         if ce_oi: calls.append({"strike": s, "oi": ce_oi})
         if pe_oi: puts.append({"strike": s, "oi": pe_oi})
         strike_map[s] = 0
-
     for test_s in sorted(strike_map):
         pain = 0
         for row in near:
@@ -903,42 +761,110 @@ def _process_nse_chain(raw: dict) -> dict | None:
             if test_s > s: pain += (test_s - s) * ce_oi
             if test_s < s: pain += (s - test_s) * pe_oi
         strike_map[test_s] = pain
-
     maxpain = min(strike_map, key=strike_map.get) if strike_map else None
     pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
-    return {
-        "pcr": pcr, "maxpain": maxpain, "expiry": nearest,
-        "spot": records.get("underlyingValue"),
-        "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
-        "top_put_oi":  sorted(puts,  key=lambda x: x["oi"], reverse=True)[:3],
-        "total_ce": total_ce, "total_pe": total_pe, "source": "nse",
-    }
+    return {"pcr": pcr, "maxpain": maxpain, "expiry": nearest, "spot": records.get("underlyingValue"),
+            "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
+            "top_put_oi": sorted(puts, key=lambda x: x["oi"], reverse=True)[:3],
+            "total_ce": total_ce, "total_pe": total_pe, "source": "nse"}
 
 
-# ── MAIN FETCH — Yahoo (crumb) → NSE (Scrape.do Indian IP) ──────────────────
-async def fetch_option_chain() -> dict:
-    """Fetch Nifty + BankNifty option data. Yahoo first, NSE fallback."""
+# ── YAHOO FINANCE WITH CRUMB (fallback) ─────────────────────────────────────
+async def _get_yahoo_crumb(client: httpx.AsyncClient):
+    now = time.time()
+    if _yahoo_crumb["crumb"] and (now - _yahoo_crumb["ts"]) < 1800:
+        return _yahoo_crumb["crumb"], _yahoo_crumb["cookies"]
+    cookies = None
+    for url in ["https://fc.yahoo.com", "https://query2.finance.yahoo.com", "https://finance.yahoo.com"]:
+        try:
+            r = await client.get(url, timeout=8)
+            if r.cookies:
+                cookies = dict(r.cookies)
+                log.info(f"✅ Yahoo cookies from {url}")
+                break
+        except: continue
+    if not cookies:
+        return None, None
+    try:
+        r = await client.get("https://query2.finance.yahoo.com/v1/test/getcrumb", cookies=cookies, timeout=8)
+        if r.status_code == 200 and r.text.strip() and len(r.text.strip()) < 50:
+            crumb = r.text.strip()
+            _yahoo_crumb.update({"crumb": crumb, "cookies": cookies, "ts": now})
+            log.info(f"✅ Yahoo crumb: {crumb[:10]}...")
+            return crumb, cookies
+    except Exception as e:
+        log.warning(f"Yahoo crumb error: {e}")
+    return None, None
+
+
+async def _fetch_yahoo_options(client: httpx.AsyncClient, symbol: str):
+    crumb, cookies = await _get_yahoo_crumb(client)
+    if not crumb: return None
+    for attempt in range(2):
+        try:
+            host = "query2" if attempt == 0 else "query1"
+            r = await client.get(f"https://{host}.finance.yahoo.com/v7/finance/options/{symbol}",
+                                 params={"crumb": crumb}, cookies=cookies, timeout=15)
+            if r.status_code != 200: continue
+            d = r.json()
+            chain = (d.get("optionChain", {}).get("result", []) or [None])[0]
+            if chain and chain.get("options") and chain["options"][0].get("calls"):
+                log.info(f"✅ Yahoo options {symbol}")
+                return chain
+        except Exception as e:
+            if attempt == 1: log.warning(f"Yahoo options {symbol}: {e}")
+    return None
+
+
+def _process_yahoo_chain(chain):
+    if not chain or not chain.get("options"): return None
+    nearest = chain["options"][0]
+    calls_raw, puts_raw = nearest.get("calls", []), nearest.get("puts", [])
+    if not calls_raw and not puts_raw: return None
+    exp_ts = nearest.get("expirationDate", 0)
+    from datetime import datetime as dt
+    expiry_str = dt.utcfromtimestamp(exp_ts).strftime("%d-%b-%Y") if exp_ts else "—"
+    total_ce, total_pe = 0, 0
+    calls, puts, all_rows = [], [], {}
+    for c in calls_raw:
+        s, oi = c.get("strike", 0), c.get("openInterest", 0) or 0
+        total_ce += oi
+        if oi > 0: calls.append({"strike": s, "oi": oi})
+        all_rows.setdefault(s, {"ce_oi": 0, "pe_oi": 0})["ce_oi"] = oi
+    for p in puts_raw:
+        s, oi = p.get("strike", 0), p.get("openInterest", 0) or 0
+        total_pe += oi
+        if oi > 0: puts.append({"strike": s, "oi": oi})
+        all_rows.setdefault(s, {"ce_oi": 0, "pe_oi": 0})["pe_oi"] = oi
+    if total_ce == 0 and total_pe == 0: return None
+    strike_pain = {}
+    for test_s in sorted(all_rows):
+        pain = sum((test_s - s) * r["ce_oi"] for s, r in all_rows.items() if test_s > s)
+        pain += sum((s - test_s) * r["pe_oi"] for s, r in all_rows.items() if test_s < s)
+        strike_pain[test_s] = pain
+    return {"pcr": round(total_pe / total_ce, 2) if total_ce else None,
+            "maxpain": min(strike_pain, key=strike_pain.get) if strike_pain else None,
+            "expiry": expiry_str, "spot": chain.get("quote", {}).get("regularMarketPrice"),
+            "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
+            "top_put_oi": sorted(puts, key=lambda x: x["oi"], reverse=True)[:3],
+            "total_ce": total_ce, "total_pe": total_pe, "source": "yahoo"}
+
+
+# ── MAIN FETCH — NSE (session) → Yahoo (crumb) ──────────────────────────────
+async def fetch_option_chain():
     result = {}
-    yahoo_map = {"nifty": "^NSEI", "bn": "^NSEBANK"}
     nse_map   = {"nifty": "NIFTY", "bn": "BANKNIFTY"}
-
+    yahoo_map = {"nifty": "^NSEI", "bn": "^NSEBANK"}
     try:
         async with httpx.AsyncClient(headers=YAHOO_HEADERS, follow_redirects=True) as client:
             for prefix in ["nifty", "bn"]:
                 processed = None
-
-                # Try 1: Yahoo Finance with crumb
-                raw = await _fetch_yahoo_options(client, yahoo_map[prefix])
-                if raw:
-                    processed = _process_yahoo_chain(raw)
-
-                # Try 2: NSE via Scrape.do (Indian geo)
+                raw = await _fetch_nse_via_session(client, nse_map[prefix])
+                if raw: processed = _process_nse_chain(raw)
                 if not processed:
-                    log.info(f"⚠️ Yahoo {yahoo_map[prefix]} failed, trying NSE via Scrape.do...")
-                    raw = await _fetch_nse_chain_via_scraper(client, nse_map[prefix])
-                    if raw:
-                        processed = _process_nse_chain(raw)
-
+                    log.info(f"⚠️ NSE {nse_map[prefix]} failed, trying Yahoo...")
+                    raw = await _fetch_yahoo_options(client, yahoo_map[prefix])
+                    if raw: processed = _process_yahoo_chain(raw)
                 if processed:
                     result[f"{prefix}_pcr"]     = processed["pcr"]
                     result[f"{prefix}_maxpain"]  = processed["maxpain"]
@@ -949,19 +875,13 @@ async def fetch_option_chain() -> dict:
                     result[f"{prefix}_total_ce"] = processed["total_ce"]
                     result[f"{prefix}_total_pe"] = processed["total_pe"]
                     result[f"{prefix}_source"]   = processed.get("source", "unknown")
-                    log.info(f"✅ {prefix.upper()} options: PCR={processed['pcr']}, "
-                             f"MaxPain={processed['maxpain']}, Source={processed['source']}")
+                    log.info(f"✅ {prefix.upper()}: PCR={processed['pcr']}, MaxPain={processed['maxpain']}, Src={processed['source']}")
                 else:
                     log.warning(f"❌ {prefix.upper()} options: all sources failed")
-
                 await asyncio.sleep(1)
-
-        if result:
-            result["updated_at"] = datetime.now().isoformat()
-
+        if result: result["updated_at"] = datetime.now().isoformat()
     except Exception as e:
         log.error(f"❌ Option chain error: {e}")
-
     return result
 
 
@@ -1148,71 +1068,53 @@ def get_options():
 
 @app.get("/api/debug-options")
 async def debug_options():
-    """Debug — tries all option chain methods and reports results."""
+    """Debug — tests session-based NSE + Yahoo crumb methods."""
     from urllib.parse import quote
+    import random, string
     results = {}
 
-    async with httpx.AsyncClient(headers=YAHOO_HEADERS, follow_redirects=True, timeout=30) as client:
+    async with httpx.AsyncClient(headers=YAHOO_HEADERS, follow_redirects=True, timeout=40) as client:
 
-        # ── Test 1: Yahoo crumb fetch ──
+        # ── Test 1: Scrape.do SESSION — two-step NSE ──
+        if SCRAPER_API_KEY:
+            sid = "dbg-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            nse_home = "https://www.nseindia.com/option-chain"
+            nse_api  = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+            try:
+                # Step 1: homepage
+                r1 = await client.get(
+                    f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_home, safe='')}&sessionId={sid}",
+                    timeout=30
+                )
+                results["session_step1_status"] = r1.status_code
+                results["session_step1_is_html"] = "<html" in r1.text[:200].lower()
+                await asyncio.sleep(2)
+                # Step 2: API with same session
+                r2 = await client.get(
+                    f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_api, safe='')}&sessionId={sid}",
+                    timeout=30
+                )
+                results["session_step2_status"] = r2.status_code
+                results["session_step2_body"] = r2.text[:400]
+                results["session_step2_has_records"] = '"records"' in r2.text[:2000]
+            except Exception as e:
+                results["session_error"] = str(e)
+
+        # ── Test 2: Yahoo crumb ──
         try:
             crumb, cookies = await _get_yahoo_crumb(client)
             results["yahoo_crumb"] = crumb[:10] + "..." if crumb else None
             results["yahoo_cookies"] = bool(cookies)
-        except Exception as e:
-            results["yahoo_crumb_error"] = str(e)
-
-        # ── Test 2: Yahoo v7 with crumb ──
-        try:
-            crumb, cookies = _yahoo_crumb["crumb"], _yahoo_crumb["cookies"]
             if crumb:
                 r = await client.get(
-                    f"https://query2.finance.yahoo.com/v7/finance/options/%5ENSEI?crumb={crumb}",
-                    cookies=cookies or {}
+                    "https://query2.finance.yahoo.com/v7/finance/options/%5ENSEI",
+                    params={"crumb": crumb}, cookies=cookies, timeout=15
                 )
-                results["yahoo_v7_crumb_status"] = r.status_code
-                body = r.text[:300]
-                results["yahoo_v7_crumb_body"] = body
-                results["yahoo_v7_has_options"] = '"calls"' in body or '"options"' in r.text[:2000]
-            else:
-                results["yahoo_v7_crumb"] = "no crumb available"
+                results["yahoo_v7_status"] = r.status_code
+                results["yahoo_v7_has_options"] = '"calls"' in r.text[:3000]
+                results["yahoo_v7_body"] = r.text[:300]
         except Exception as e:
-            results["yahoo_v7_crumb_error"] = str(e)
-
-        # ── Test 3: Scrape.do → NSE with geoCode=in + super ──
-        if SCRAPER_API_KEY:
-            nse_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-            try:
-                proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&super=true&geoCode=in"
-                r = await client.get(proxy_url)
-                results["scrape_geo_super_status"] = r.status_code
-                results["scrape_geo_super_body"] = r.text[:400]
-                results["scrape_geo_super_has_records"] = '"records"' in r.text[:1000]
-            except Exception as e:
-                results["scrape_geo_super_error"] = str(e)
-
-            # ── Test 4: Scrape.do → NSE with geoCode=in (no super) ──
-            try:
-                proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&geoCode=in"
-                r = await client.get(proxy_url)
-                results["scrape_geo_normal_status"] = r.status_code
-                results["scrape_geo_normal_body"] = r.text[:400]
-                results["scrape_geo_normal_has_records"] = '"records"' in r.text[:1000]
-            except Exception as e:
-                results["scrape_geo_normal_error"] = str(e)
-
-            # ── Test 5: Scrape.do → NSE with customHeaders ──
-            try:
-                proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&customHeaders=true"
-                r = await client.get(proxy_url, headers={
-                    "sd-Accept": "application/json",
-                    "sd-Referer": "https://www.nseindia.com/option-chain",
-                })
-                results["scrape_custom_status"] = r.status_code
-                results["scrape_custom_body"] = r.text[:400]
-                results["scrape_custom_has_records"] = '"records"' in r.text[:1000]
-            except Exception as e:
-                results["scrape_custom_error"] = str(e)
+            results["yahoo_error"] = str(e)
 
     return JSONResponse(results)
 
