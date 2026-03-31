@@ -1143,6 +1143,76 @@ def get_sparklines():
 def get_options():
     return JSONResponse(cache["options"]["data"])
 
+@app.get("/api/debug-options")
+async def debug_options():
+    """Debug endpoint — tries all option chain methods and reports results."""
+    from urllib.parse import quote
+    results = {}
+
+    async with httpx.AsyncClient(headers=YAHOO_HEADERS, follow_redirects=True, timeout=30) as client:
+
+        # ── Test 1: Yahoo Finance v7 options ──
+        try:
+            r = await client.get("https://query1.finance.yahoo.com/v7/finance/options/%5ENSEI")
+            results["yahoo_v7_status"] = r.status_code
+            results["yahoo_v7_body"] = r.text[:500]
+        except Exception as e:
+            results["yahoo_v7_error"] = str(e)
+
+        # ── Test 2: Yahoo Finance v6 quote with options ──
+        try:
+            r = await client.get("https://query1.finance.yahoo.com/v6/finance/options/%5ENSEI")
+            results["yahoo_v6_status"] = r.status_code
+            results["yahoo_v6_body"] = r.text[:500]
+        except Exception as e:
+            results["yahoo_v6_error"] = str(e)
+
+        # ── Test 3: Scrape.do → NSE with super=true ──
+        if SCRAPER_API_KEY:
+            nse_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+            try:
+                proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&super=true"
+                r = await client.get(proxy_url)
+                results["scrape_super_status"] = r.status_code
+                results["scrape_super_body"] = r.text[:500]
+            except Exception as e:
+                results["scrape_super_error"] = str(e)
+
+            # ── Test 4: Scrape.do → NSE without super ──
+            try:
+                proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}"
+                r = await client.get(proxy_url)
+                results["scrape_normal_status"] = r.status_code
+                results["scrape_normal_body"] = r.text[:500]
+            except Exception as e:
+                results["scrape_normal_error"] = str(e)
+
+            # ── Test 5: Scrape.do → NSE with render=true ──
+            try:
+                proxy_url = f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_url, safe='')}&render=true"
+                r = await client.get(proxy_url)
+                results["scrape_render_status"] = r.status_code
+                results["scrape_render_body"] = r.text[:500]
+            except Exception as e:
+                results["scrape_render_error"] = str(e)
+
+        # ── Test 6: Direct NSE (expected to fail from US) ──
+        try:
+            cookies = await _get_nse_cookies(client)
+            results["nse_cookies"] = bool(cookies)
+            if cookies:
+                r = await client.get(
+                    "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+                    headers=NSE_HEADERS, cookies=cookies
+                )
+                results["nse_direct_status"] = r.status_code
+                results["nse_direct_body"] = r.text[:500]
+        except Exception as e:
+            results["nse_direct_error"] = str(e)
+
+    return JSONResponse(results)
+
+
 @app.get("/api/health")
 def health():
     now = time.time()
