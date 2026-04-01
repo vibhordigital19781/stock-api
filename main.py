@@ -432,8 +432,29 @@ async def fetch_india_stock_rss() -> list:
         # Zee Business
         ("https://www.zeebiz.com/rss",                            "Zee Business"),
         # Economic Times — more specific
-        ("https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2143736.cms", "ET Stocks"),
-        ("https://economictimes.indiatimes.com/markets/stocks/earnings/rssfeeds/2143759.cms", "ET Earnings"),
+        ("https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2143736.cms",    "ET Stocks"),
+        ("https://economictimes.indiatimes.com/markets/stocks/earnings/rssfeeds/2143759.cms","ET Earnings"),
+        ("https://economictimes.indiatimes.com/markets/ipo/rss.cms",                         "ET IPO"),
+        # Business Today
+        ("https://www.businesstoday.in/rssfeeds/1260657.cms",     "Business Today"),
+        # Outlook Money
+        ("https://www.outlookmoney.com/feed",                     "Outlook Money"),
+        # The Ken (free articles)
+        ("https://the-ken.com/feed/",                             "The Ken"),
+        # Entrackr (startup/IPO)
+        ("https://entrackr.com/feed/",                            "Entrackr"),
+        # Inc42 Markets
+        ("https://inc42.com/feed/",                               "Inc42"),
+        # India Infoline
+        ("https://www.indiainfoline.com/rss/news.xml",            "IIFL"),
+        # 5Paisa
+        ("https://www.5paisa.com/blog/feed/",                     "5Paisa"),
+        # StockEdge blog
+        ("https://blog.stockedge.com/feed/",                      "StockEdge"),
+        # Trade Brains
+        ("https://tradebrains.in/feed/",                          "Trade Brains"),
+        # Finshots (great for retail readers)
+        ("https://finshots.in/archive/rss/",                      "Finshots"),
     ]
     items = []
     seen  = set()
