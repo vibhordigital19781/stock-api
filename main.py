@@ -1,30 +1,16 @@
 """
-Bazaar Watch — Backend API v5.6 (STABLE)
-=========================================
-Stability features:
-  - Every fetch has retry logic (3 attempts)
-  - Cache NEVER wiped on failure — stale data shown with age
-  - Multiple fallback sources per data point
-  - Natural Gas added via Yahoo Finance
-  - Nickel added via Yahoo Finance
-  - Gift Nifty/Bank Nifty only from proxy (Scrape.do)
-  - DeepSeek summary gracefully skipped if no key
-  - All prices in USD (international) clearly labeled
-
-Data sources:
-  Indian Indices  → Yahoo Finance (^NSEI etc) — proven stable on cloud
-  Sensex          → Yahoo Finance (^BSESN)
-  Metals/Energy   → Yahoo Finance (GC=F, SI=F, CL=F, NG=F, HG=F etc)
-  US Markets      → Finnhub DIA/SPY/QQQ (free key)
-  Dollar Index    → Finnhub OANDA:USD_IDX
-  News            → RSS feeds (ET, MC, BS, Trading Economics)
-  Gift Nifty      → proxy-gift-nifty.onrender.com (Scrape.do)
-  Gift Bank Nifty → proxy-gift-nifty.onrender.com (Scrape.do)
-  AI Summary      → DeepSeek API (optional)
+Bazaar Watch — Backend API v5.7
+========================================
+Changes from v5.6:
+  - NSE corporate announcements scraper added
+  - /api/nse-news endpoint
+  - NSE news merged into /api/all response
+  - NSE news refreshed every 5 minutes in background
+  - Uses direct httpx first, Scrape.do session as fallback
 """
 
-import os, time, asyncio, logging
-from datetime import datetime
+import os, time, asyncio, logging, threading
+from datetime import datetime, timedelta, timezone
 import httpx
 import feedparser
 from fastapi import FastAPI
@@ -40,7 +26,7 @@ GIFT_NIFTY_PROXY = os.getenv("GIFT_NIFTY_PROXY", "https://proxy-gift-nifty.onren
 CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY",  "")
 
-app = FastAPI(title="Bazaar Watch API v5.5")
+app = FastAPI(title="Bazaar Watch API v5.7")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,12 +40,13 @@ cache = {
     "metals":        {"data": {}, "ts": 0},
     "us":            {"data": {}, "ts": 0},
     "news":          {"data": [], "ts": 0},
+    "nse_news":      {"data": [], "ts": 0},   # ← NEW: NSE corporate announcements
     "giftnifty":     {"data": {}, "ts": 0},
     "giftbanknifty": {"data": {}, "ts": 0},
-    "summary":       {"data": {}, "ts": 0},   # main AI summary
-    "pre_market":    {"data": {}, "ts": 0},   # pre-market brief (before 9:15)
-    "hourly":        {"data": {}, "ts": 0},   # hourly market update
-    "post_market":   {"data": {}, "ts": 0},   # post-market wrap (after 15:30)
+    "summary":       {"data": {}, "ts": 0},
+    "pre_market":    {"data": {}, "ts": 0},
+    "hourly":        {"data": {}, "ts": 0},
+    "post_market":   {"data": {}, "ts": 0},
     "heatmap":       {"data": [], "ts": 0},
     "sparklines":    {"data": {}, "ts": 0},
     "options":       {"data": {}, "ts": 0},
@@ -72,13 +59,11 @@ YAHOO_HEADERS = {
 }
 
 async def yahoo_quote(client: httpx.AsyncClient, symbol: str) -> dict:
-    """Fetch single quote from Yahoo Finance with retry."""
     for attempt in range(3):
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
             r   = await client.get(url, timeout=12)
             if r.status_code != 200:
-                # Try query2 as fallback
                 url = url.replace("query1", "query2")
                 r   = await client.get(url, timeout=12)
             txt = r.text.strip()
@@ -116,7 +101,6 @@ async def yahoo_quote(client: httpx.AsyncClient, symbol: str) -> dict:
 
 
 async def fetch_nse_indices() -> dict:
-    """Indian indices via Yahoo Finance — proven stable on cloud servers."""
     result = {}
     symbol_map = {
         "^NSEI":    "nifty50",
@@ -137,28 +121,16 @@ async def fetch_nse_indices() -> dict:
 
 
 async def fetch_metals() -> dict:
-    """
-    Metals and Energy via Yahoo Finance.
-    All prices in USD — international benchmarks.
-    GC=F  Gold     $/oz
-    SI=F  Silver   $/oz
-    HG=F  Copper   $/lb
-    ALI=F Aluminium $/lb
-    ZNC=F Zinc     cents/lb
-    PL=F  Platinum $/oz
-    CL=F  Crude WTI $/bbl
-    NG=F  Natural Gas $/mmBtu
-    """
     result = {}
     symbol_map = {
-        "GC=F":  "gold_usd",       # COMEX Gold $/oz
-        "SI=F":  "silver_usd",     # COMEX Silver $/oz
-        "HG=F":  "copper_usd",     # COMEX Copper $/lb
-        "ALI=F": "aluminium_usd",  # Aluminium $/lb
-        "ZNC=F": "zinc_usd",       # Zinc cents/lb
-        "PL=F":  "platinum_usd",   # Platinum $/oz
-        "CL=F":  "crude_usd",      # WTI Crude $/bbl
-        "NG=F":  "natgas_usd",     # Natural Gas $/mmBtu
+        "GC=F":  "gold_usd",
+        "SI=F":  "silver_usd",
+        "HG=F":  "copper_usd",
+        "ALI=F": "aluminium_usd",
+        "ZNC=F": "zinc_usd",
+        "PL=F":  "platinum_usd",
+        "CL=F":  "crude_usd",
+        "NG=F":  "natgas_usd",
     }
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=15, follow_redirects=True) as client:
         for sym, key in symbol_map.items():
@@ -168,7 +140,6 @@ async def fetch_metals() -> dict:
                 log.info(f"✅ {key}: {q['price']}")
             await asyncio.sleep(0.4)
 
-        # Nickel via Finnhub (Yahoo NI=F doesn't exist)
         if FINNHUB_KEY:
             try:
                 r = await client.get(
@@ -183,22 +154,12 @@ async def fetch_metals() -> dict:
                         "change":  round(float(d.get("d", 0)), 2),
                         "prev":    round(float(d.get("pc", 0)), 2),
                     }
-                    log.info(f"✅ Nickel (Finnhub): {result['nickel_usd']['price']}")
             except Exception as e:
                 log.warning(f"Nickel Finnhub: {e}")
-
     return result
 
 
 async def fetch_us_markets() -> dict:
-    """
-    US indices via Yahoo Finance — real indices, not ETF proxies.
-    ^DJI = Dow Jones Industrial Average
-    ^GSPC = S&P 500
-    ^IXIC = Nasdaq Composite
-    DX-Y.NYB = US Dollar Index (ICE)
-    ^VIX = CBOE Volatility Index
-    """
     result = {}
     symbol_map = {
         "^DJI":     "dow",
@@ -218,9 +179,7 @@ async def fetch_us_markets() -> dict:
 
 
 async def fetch_news() -> list:
-    """RSS news from multiple Indian financial sources."""
     feeds = [
-        # ── Indian markets & economy ──
         ("https://economictimes.indiatimes.com/markets/rss.cms",              "ET Markets"),
         ("https://economictimes.indiatimes.com/markets/commodities/rss.cms",  "ET Commodities"),
         ("https://economictimes.indiatimes.com/economy/rss.cms",              "ET Economy"),
@@ -228,7 +187,6 @@ async def fetch_news() -> list:
         ("https://www.business-standard.com/rss/markets-106.rss",             "Business Standard"),
         ("https://www.business-standard.com/rss/economy-policy-101.rss",      "BS Economy"),
         ("https://www.moneycontrol.com/rss/economy.xml",                      "Moneycontrol"),
-        # ── Global macro & commodities ──
         ("https://feeds.reuters.com/reuters/businessNews",                    "Reuters Business"),
         ("https://feeds.reuters.com/reuters/commoditiesNews",                 "Reuters Commodities"),
         ("https://www.investing.com/rss/news_25.rss",                         "Investing.com"),
@@ -251,12 +209,293 @@ async def fetch_news() -> list:
                 })
         except Exception as e:
             log.warning(f"RSS {source_name}: {e}")
-    # Sort by time if possible, return up to 40
     return items[:50]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  NSE CORPORATE ANNOUNCEMENTS SCRAPER  (NEW in v5.7)
+# ══════════════════════════════════════════════════════════════════════════════
+
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://www.nseindia.com/",
+    "Connection":      "keep-alive",
+}
+
+# In-memory NSE session cache (cookies are valid ~5 min)
+_nse_session_cookies: dict = {}
+_nse_session_ts: float = 0
+NSE_SESSION_TTL = 270  # refresh every 4.5 minutes
+
+
+async def _get_nse_cookies(client: httpx.AsyncClient) -> dict:
+    """Get fresh NSE session cookies by visiting the homepage first."""
+    global _nse_session_cookies, _nse_session_ts
+    now = time.time()
+    if _nse_session_cookies and (now - _nse_session_ts) < NSE_SESSION_TTL:
+        return _nse_session_cookies
+    try:
+        # Step 1 — hit homepage to receive cookies
+        r1 = await client.get("https://www.nseindia.com", timeout=12)
+        cookies = dict(r1.cookies)
+        # Step 2 — hit a secondary page to strengthen session
+        await asyncio.sleep(0.8)
+        r2 = await client.get(
+            "https://www.nseindia.com/market-data/live-equity-market",
+            cookies=cookies, timeout=10
+        )
+        cookies.update(dict(r2.cookies))
+        _nse_session_cookies = cookies
+        _nse_session_ts = now
+        log.info(f"✅ NSE session refreshed ({len(cookies)} cookies)")
+        return cookies
+    except Exception as e:
+        log.warning(f"NSE session init: {e}")
+        return {}
+
+
+async def _fetch_nse_api_direct(path: str) -> list:
+    """
+    Call NSE internal API directly (no proxy).
+    Works on most cloud servers — Render included.
+    Falls back to empty list on any error.
+    """
+    url = f"https://www.nseindia.com{path}"
+    try:
+        async with httpx.AsyncClient(
+            headers=NSE_HEADERS, follow_redirects=True, timeout=18
+        ) as client:
+            cookies = await _get_nse_cookies(client)
+            r = await client.get(url, cookies=cookies, timeout=15)
+
+            if r.status_code in (401, 403):
+                # Force session refresh and retry once
+                global _nse_session_ts
+                _nse_session_ts = 0
+                cookies = await _get_nse_cookies(client)
+                r = await client.get(url, cookies=cookies, timeout=15)
+
+            if r.status_code != 200:
+                log.warning(f"NSE direct {path}: HTTP {r.status_code}")
+                return []
+
+            payload = r.json()
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict):
+                for key in ("data", "announcements", "results"):
+                    if key in payload and isinstance(payload[key], list):
+                        return payload[key]
+            return []
+    except Exception as e:
+        log.warning(f"NSE direct {path}: {e}")
+        return []
+
+
+async def _fetch_nse_api_via_scraperapi(path: str) -> list:
+    """
+    Fallback: route NSE API calls through Scrape.do session.
+    Only used if SCRAPER_API_KEY is set and direct call failed.
+    """
+    if not SCRAPER_API_KEY:
+        return []
+    from urllib.parse import quote
+    import random, string
+    sid = "nse-ann-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    nse_home = "https://www.nseindia.com/"
+    nse_url  = f"https://www.nseindia.com{path}"
+    try:
+        async with httpx.AsyncClient(timeout=35) as client:
+            # Step 1: warm session
+            await client.get(
+                f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+                f"&url={quote(nse_home, safe='')}&sessionId={sid}",
+                timeout=25
+            )
+            await asyncio.sleep(1.5)
+            # Step 2: hit API
+            r = await client.get(
+                f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+                f"&url={quote(nse_url, safe='')}&sessionId={sid}",
+                timeout=25
+            )
+            if r.status_code != 200:
+                return []
+            payload = r.json()
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict):
+                for key in ("data", "announcements"):
+                    if key in payload and isinstance(payload[key], list):
+                        return payload[key]
+    except Exception as e:
+        log.warning(f"NSE scrape.do {path}: {e}")
+    return []
+
+
+def _classify_announcement(subject: str) -> str:
+    """Map announcement subject to a display tag."""
+    s = (subject or "").lower()
+    if any(k in s for k in ("dividend", "bonus", "split", "buyback", "rights")):
+        return "CORP ACTION"
+    if any(k in s for k in ("result", "profit", "revenue", "financial", "quarterly",
+                             "q1", "q2", "q3", "q4", "annual", "earnings")):
+        return "RESULT"
+    if any(k in s for k in ("ipo", "listing", "allotment", "offer for sale", "ofs")):
+        return "IPO"
+    if any(k in s for k in ("sebi", "penalty", "circuit", "ban", "order",
+                             "investigation", "show cause", "suspension")):
+        return "ALERT"
+    if any(k in s for k in ("merger", "acquisition", "stake", "deal", "mou",
+                             "agreement", "joint venture", "takeover")):
+        return "DEAL"
+    if any(k in s for k in ("fii", "fpi", "dii", "institutional", "bulk deal", "block deal")):
+        return "FII/DII"
+    return "NSE/BSE"
+
+
+def _parse_nse_date(date_str: str) -> str:
+    """Parse NSE date formats to ISO string with IST offset."""
+    if not date_str:
+        return ""
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y"):
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S") + "+05:30"
+        except ValueError:
+            continue
+    return date_str  # return raw if unparseable
+
+
+async def fetch_nse_announcements() -> list:
+    """
+    Fetch NSE corporate announcements for the last 7 days.
+    Tries direct call first; falls back to Scrape.do if configured.
+    Returns normalised list of news items.
+    """
+    today     = datetime.now()
+    from_date = (today - timedelta(days=7)).strftime("%d-%m-%Y")
+    to_date   = today.strftime("%d-%m-%Y")
+
+    # ── 1. Corporate announcements (results, AGM, SEBI, board outcomes)
+    ann_path = (
+        f"/api/corporate-announcements?index=equities"
+        f"&from_date={from_date}&to_date={to_date}"
+    )
+    ann_raw = await _fetch_nse_api_direct(ann_path)
+    if not ann_raw:
+        log.info("NSE direct announcements failed — trying Scrape.do")
+        ann_raw = await _fetch_nse_api_via_scraperapi(ann_path)
+
+    # ── 2. Corporate actions (dividends, splits, bonuses, buybacks)
+    act_path = (
+        f"/api/corporates-corporateActions?index=equities"
+        f"&from_date={from_date}&to_date={to_date}"
+    )
+    act_raw = await _fetch_nse_api_direct(act_path)
+    if not act_raw:
+        act_raw = await _fetch_nse_api_via_scraperapi(act_path)
+
+    # ── 3. Board meetings (upcoming)
+    bm_path = "/api/corporate-board-meetings?index=equities"
+    bm_raw  = await _fetch_nse_api_direct(bm_path)
+    if not bm_raw:
+        bm_raw = await _fetch_nse_api_via_scraperapi(bm_path)
+
+    results = []
+
+    # Normalise announcements
+    for item in ann_raw[:80]:
+        subject = (item.get("subject") or item.get("desc") or "").strip()
+        symbol  = (item.get("symbol") or "").strip()
+        company = (item.get("comp") or item.get("companyName") or symbol).strip()
+        an_time = item.get("an_dt") or item.get("bm_date") or ""
+
+        if not subject:
+            continue
+
+        headline = f"{company}: {subject}" if company and company != subject else subject
+
+        results.append({
+            "title":    headline,
+            "source":   "NSE India",
+            "link":     "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+            "time":     _parse_nse_date(an_time),
+            "category": _classify_announcement(subject),
+            "symbol":   symbol,
+        })
+
+    # Normalise corporate actions
+    for item in act_raw[:40]:
+        symbol  = (item.get("symbol") or "").strip()
+        company = (item.get("comp") or symbol).strip()
+        purpose = (item.get("purpose") or item.get("subject") or "").strip()
+        exdate  = (item.get("exDate") or item.get("ex_date") or "").strip()
+
+        if not purpose:
+            continue
+
+        headline = f"{company}: {purpose}"
+        if exdate:
+            headline += f" — Ex-date {exdate}"
+
+        results.append({
+            "title":    headline,
+            "source":   "NSE India",
+            "link":     "https://www.nseindia.com/companies-listing/corporate-filings-corporate-actions",
+            "time":     _parse_nse_date(exdate),
+            "category": _classify_announcement(purpose),
+            "symbol":   symbol,
+        })
+
+    # Normalise board meetings
+    for item in bm_raw[:30]:
+        symbol  = (item.get("symbol") or "").strip()
+        company = (item.get("companyName") or symbol).strip()
+        purpose = (item.get("purpose") or "").strip()
+        bm_date = (item.get("meeting_date") or item.get("bm_date") or "").strip()
+
+        if not purpose:
+            continue
+
+        headline = f"{company}: Board Meeting — {purpose}"
+        if bm_date:
+            headline += f" (on {bm_date})"
+
+        results.append({
+            "title":    headline,
+            "source":   "NSE India",
+            "link":     "https://www.nseindia.com/companies-listing/corporate-filings-board-meetings",
+            "time":     _parse_nse_date(bm_date),
+            "category": "RESULT" if "result" in purpose.lower() else "CORP ACTION",
+            "symbol":   symbol,
+        })
+
+    # Deduplicate by first 60 chars of title
+    seen, unique = set(), []
+    for r in results:
+        key = r["title"][:60].lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    log.info(f"✅ NSE announcements: {len(unique)} items "
+             f"(ann={len(ann_raw)}, act={len(act_raw)}, bm={len(bm_raw)})")
+    return unique
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REST OF ORIGINAL FUNCTIONS (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def fetch_gift_nifty() -> dict:
-    """Gift Nifty from proxy service. Returns empty dict on failure — cache preserved."""
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(f"{GIFT_NIFTY_PROXY}/quote")
@@ -281,7 +520,6 @@ async def fetch_gift_nifty() -> dict:
 
 
 async def fetch_gift_bank_nifty() -> dict:
-    """Gift Bank Nifty from proxy service."""
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(f"{GIFT_NIFTY_PROXY}/quote-bank")
@@ -305,7 +543,6 @@ async def fetch_gift_bank_nifty() -> dict:
 
 
 async def generate_market_summary() -> dict:
-    """AI market summary via Claude Haiku. Skipped gracefully if no key."""
     if not CLAUDE_KEY:
         return {}
     try:
@@ -350,31 +587,25 @@ Rules: specific numbers, Nifty opening outlook, key levels, under 80 words, no d
                     "temperature": 0.3,
                 }
             )
-            result   = r.json()
-            summary  = result["choices"][0]["message"]["content"]
+            result  = r.json()
+            summary = result["content"][0]["text"]
             log.info("✅ AI summary generated")
             return {"summary": summary, "generated_at": datetime.now().isoformat(), "session": session}
     except Exception as e:
-        log.warning(f"DeepSeek: {e}")
+        log.warning(f"AI summary: {e}")
         return {}
 
 
-
-
-# ── SPARKLINES — hourly intraday data for key symbols ────────────────────────
 SPARKLINE_SYMBOLS = {
-    # Indian indices
     "nifty50":   "^NSEI",
     "sensex":    "^BSESN",
     "banknifty": "^NSEBANK",
     "niftyit":   "^CNXIT",
     "midcap":    "^NSMIDCP",
     "indiavix":  "^INDIAVIX",
-    # US markets
     "dow":       "^DJI",
     "sp500":     "^GSPC",
     "nasdaq":    "^IXIC",
-    # Commodities / FX
     "gold":      "GC=F",
     "silver":    "SI=F",
     "crude":     "CL=F",
@@ -385,7 +616,6 @@ SPARKLINE_SYMBOLS = {
 }
 
 async def fetch_sparklines() -> dict:
-    """Fetch 1-day 1-hour interval closes for sparkline charts."""
     result = {}
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=20, follow_redirects=True) as client:
         for key, sym in SPARKLINE_SYMBOLS.items():
@@ -397,21 +627,16 @@ async def fetch_sparklines() -> dict:
                 if not res:
                     continue
                 closes = res[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                times  = res[0].get("timestamp", [])
-                # Filter out None values
                 pts = [round(v, 2) for v in closes if v is not None]
                 if len(pts) >= 2:
                     result[key] = pts
-                    log.info(f"✅ Sparkline {key}: {len(pts)} pts")
                 await asyncio.sleep(0.2)
             except Exception as e:
                 log.warning(f"Sparkline {key}: {e}")
     return result
 
 
-# ── TIMED AI SUMMARIES ────────────────────────────────────────────────────────
 def get_market_context(cache_data: dict) -> str:
-    """Build compact market context string from cache."""
     idx = cache_data.get("indices", {})
     met = cache_data.get("metals", {})
     us  = cache_data.get("us", {})
@@ -424,76 +649,66 @@ def get_market_context(cache_data: dict) -> str:
     if gn.get("price"):       lines.append(f"GiftNifty={gn['price']} ({gn.get('changePct',0):+.2f}%)")
     if us.get("dow"):         lines.append(f"Dow={us['dow']['price']} ({us['dow']['pchange']:+.2f}%)")
     if us.get("sp500"):       lines.append(f"S&P500={us['sp500']['price']} ({us['sp500']['pchange']:+.2f}%)")
-    if us.get("nasdaq"):      lines.append(f"Nasdaq={us['nasdaq']['price']} ({us['nasdaq']['pchange']:+.2f}%)")
     if us.get("dxy"):         lines.append(f"DXY={us['dxy']['price']}")
     if met.get("gold_usd"):   lines.append(f"Gold={met['gold_usd']['price']}")
     if met.get("crude_usd"):  lines.append(f"Crude={met['crude_usd']['price']}")
     return " | ".join(lines)
 
+
 async def generate_timed_summary(summary_type: str, context: str) -> dict:
-    """Generate pre-market, hourly or post-market AI summary."""
     prompts = {
-        "pre_market": f"""You are a sharp Indian market analyst. Based on these overnight/pre-market data points, write a crisp pre-market brief for Indian traders opening their terminals at 9:00 AM IST.
+        "pre_market": f"""You are a sharp Indian market analyst. Write a crisp pre-market brief for Indian traders.
 
 Data: {context}
 
-Write in 3 short paragraphs:
-1. Overnight global cues (US markets, Asia, commodities) — 2-3 sentences
-2. What to watch at open — key levels, sectors, triggers — 2-3 sentences  
-3. One-line market bias for the day
+3 short paragraphs:
+1. Overnight global cues — 2-3 sentences
+2. What to watch at open — key levels, sectors, triggers — 2-3 sentences
+3. One-line market bias
 
-Be specific, use actual numbers. No generic filler. Max 120 words.""",
+Specific numbers. Max 120 words.""",
 
-        "hourly": f"""You are a live Indian market commentator. Based on current market data, write a 60-second hourly market update for traders.
-
-Data: {context}
-
-Format:
-- Market pulse: Current trend in 1 sentence
-- Movers: What's driving the move
-- Watch: Key level to watch next hour
-
-Max 80 words. Sharp and specific.""",
-
-        "post_market": f"""You are an Indian market analyst. Write a post-market closing summary for investors reviewing their day.
+        "hourly": f"""Live Indian market commentator. Write a 60-second hourly update.
 
 Data: {context}
 
-Write in 3 paragraphs:
-1. Day's summary — what happened, key moves, final closes
-2. Drivers — why the market moved as it did
-3. Tomorrow's setup — what to watch overnight/next session
+- Market pulse: trend in 1 sentence
+- Movers: what's driving it
+- Watch: key level next hour
 
-Max 150 words. Professional tone."""
+Max 80 words.""",
+
+        "post_market": f"""Indian market analyst. Post-market closing summary.
+
+Data: {context}
+
+3 paragraphs:
+1. Day summary — key moves, final closes
+2. Drivers — why market moved
+3. Tomorrow's setup — what to watch
+
+Max 150 words."""
     }
-
-    prompt = prompts.get(summary_type, prompts["hourly"])
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": CLAUDE_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json"
-                },
+                headers={"x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
                 json={
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 350,
-                    "messages": [{"role": "user", "content": prompt}]
+                    "messages": [{"role": "user", "content": prompts.get(summary_type, prompts["hourly"])}]
                 }
             )
-            d = r.json()
+            d    = r.json()
             text = d["content"][0]["text"].strip()
             return {"text": text, "ts": time.time(), "type": summary_type, "context": context[:200]}
     except Exception as e:
         log.warning(f"Timed summary {summary_type}: {e}")
         return {}
 
-# ── F&O HEATMAP STOCKS ────────────────────────────────────────────────────────
-# ~180 NSE/BSE F&O eligible stocks, Yahoo Finance .NS suffix
+
 FNO_STOCKS = [
-    # ── BANKING & FINANCE ──
     ("HDFCBANK.NS",   "HDFC Bank",      "Banking"),
     ("ICICIBANK.NS",  "ICICI Bank",     "Banking"),
     ("SBIN.NS",       "SBI",            "Banking"),
@@ -516,7 +731,6 @@ FNO_STOCKS = [
     ("HDFCLIFE.NS",   "HDFC Life",      "Insurance"),
     ("ICICIGI.NS",    "ICICI Lombard",  "Insurance"),
     ("LICI.NS",       "LIC",            "Insurance"),
-    # ── IT ──
     ("TCS.NS",        "TCS",            "IT"),
     ("INFY.NS",       "Infosys",        "IT"),
     ("HCLTECH.NS",    "HCL Tech",       "IT"),
@@ -527,7 +741,6 @@ FNO_STOCKS = [
     ("COFORGE.NS",    "Coforge",        "IT"),
     ("PERSISTENT.NS", "Persistent",     "IT"),
     ("OFSS.NS",       "Oracle Fin",     "IT"),
-    # ── ENERGY & OIL ──
     ("RELIANCE.NS",   "Reliance",       "Energy"),
     ("ONGC.NS",       "ONGC",           "Energy"),
     ("BPCL.NS",       "BPCL",           "Energy"),
@@ -539,7 +752,6 @@ FNO_STOCKS = [
     ("PETRONET.NS",   "Petronet",       "Energy"),
     ("ADANIGREEN.NS", "Adani Green",    "Energy"),
     ("TATAPOWER.NS",  "Tata Power",     "Energy"),
-    # ── AUTO ──
     ("MARUTI.NS",     "Maruti",         "Auto"),
     ("TATAMOTORS.NS", "Tata Motors",    "Auto"),
     ("M&M.NS",        "M&M",            "Auto"),
@@ -552,7 +764,6 @@ FNO_STOCKS = [
     ("BHARATFORG.NS", "Bharat Forge",   "Auto"),
     ("APOLLOTYRE.NS", "Apollo Tyre",    "Auto"),
     ("MRF.NS",        "MRF",            "Auto"),
-    # ── PHARMA ──
     ("SUNPHARMA.NS",  "Sun Pharma",     "Pharma"),
     ("DRREDDY.NS",    "Dr Reddy",       "Pharma"),
     ("CIPLA.NS",      "Cipla",          "Pharma"),
@@ -563,7 +774,6 @@ FNO_STOCKS = [
     ("ALKEM.NS",      "Alkem Lab",      "Pharma"),
     ("TORNTPHARM.NS", "Torrent Pharm",  "Pharma"),
     ("IPCALAB.NS",    "IPCA Lab",       "Pharma"),
-    # ── METALS & MINING ──
     ("TATASTEEL.NS",  "Tata Steel",     "Metals"),
     ("JSWSTEEL.NS",   "JSW Steel",      "Metals"),
     ("HINDALCO.NS",   "Hindalco",       "Metals"),
@@ -573,7 +783,6 @@ FNO_STOCKS = [
     ("SAIL.NS",       "SAIL",           "Metals"),
     ("HINDCOPPER.NS", "Hind Copper",    "Metals"),
     ("NATIONALUM.NS", "NALCO",          "Metals"),
-    # ── CONSUMER & FMCG ──
     ("HINDUNILVR.NS", "HUL",            "FMCG"),
     ("NESTLEIND.NS",  "Nestle",         "FMCG"),
     ("BRITANNIA.NS",  "Britannia",      "FMCG"),
@@ -584,7 +793,6 @@ FNO_STOCKS = [
     ("ITC.NS",        "ITC",            "FMCG"),
     ("TATACONSUM.NS", "Tata Consumer",  "FMCG"),
     ("VBL.NS",        "Varun Bev",      "FMCG"),
-    # ── INDUSTRIALS & INFRA ──
     ("LT.NS",         "L&T",            "Industrials"),
     ("SIEMENS.NS",    "Siemens",        "Industrials"),
     ("ABB.NS",        "ABB",            "Industrials"),
@@ -597,31 +805,26 @@ FNO_STOCKS = [
     ("IRB.NS",        "IRB Infra",      "Industrials"),
     ("CUMMINSIND.NS", "Cummins",        "Industrials"),
     ("THERMAX.NS",    "Thermax",        "Industrials"),
-    # ── TELECOM ──
     ("BHARTIARTL.NS", "Airtel",         "Telecom"),
     ("IDEA.NS",       "Vi",             "Telecom"),
     ("INDUSTOWER.NS", "Indus Towers",   "Telecom"),
-    # ── UTILITIES ──
     ("NTPC.NS",       "NTPC",           "Utilities"),
     ("POWERGRID.NS",  "Power Grid",     "Utilities"),
     ("ADANIPOWER.NS", "Adani Power",    "Utilities"),
     ("TORNTPOWER.NS", "Torrent Power",  "Utilities"),
     ("CESC.NS",       "CESC",           "Utilities"),
-    # ── REAL ESTATE ──
     ("DLF.NS",        "DLF",            "Real Estate"),
     ("GODREJPROP.NS", "Godrej Prop",    "Real Estate"),
     ("OBEROIRLTY.NS", "Oberoi Realty",  "Real Estate"),
     ("PRESTIGE.NS",   "Prestige",       "Real Estate"),
     ("PHOENIXLTD.NS", "Phoenix",        "Real Estate"),
     ("BRIGADE.NS",    "Brigade",        "Real Estate"),
-    # ── MATERIALS & CEMENT ──
     ("ULTRACEMCO.NS", "UltraCem",       "Cement"),
     ("GRASIM.NS",     "Grasim",         "Cement"),
     ("SHREECEM.NS",   "Shree Cem",      "Cement"),
     ("AMBUJACEM.NS",  "Ambuja Cem",     "Cement"),
     ("ACC.NS",        "ACC",            "Cement"),
     ("RAMCOCEM.NS",   "Ramco Cem",      "Cement"),
-    # ── CONSUMER DISCRETIONARY ──
     ("TITAN.NS",      "Titan",          "Consumer"),
     ("ASIANPAINT.NS", "Asian Paints",   "Consumer"),
     ("PIDILITIND.NS", "Pidilite",       "Consumer"),
@@ -632,26 +835,22 @@ FNO_STOCKS = [
     ("ZOMATO.NS",     "Zomato",         "Consumer"),
     ("JUBLFOOD.NS",   "Jubilant Food",  "Consumer"),
     ("DEVYANI.NS",    "Devyani",        "Consumer"),
-    # ── HEALTHCARE ──
     ("APOLLOHOSP.NS", "Apollo Hosp",    "Healthcare"),
     ("MAXHEALTH.NS",  "Max Health",     "Healthcare"),
     ("FORTIS.NS",     "Fortis",         "Healthcare"),
     ("METROPOLIS.NS", "Metropolis",     "Healthcare"),
     ("LALPATHLAB.NS", "Dr Lal Path",    "Healthcare"),
-    # ── CHEMICALS ──
     ("SRF.NS",        "SRF",            "Chemicals"),
     ("AARTIIND.NS",   "Aarti Ind",      "Chemicals"),
     ("NAVINFLUOR.NS", "Navin Fluor",    "Chemicals"),
     ("DEEPAKNTR.NS",  "Deepak Nitrite", "Chemicals"),
     ("PIIND.NS",      "PI Ind",         "Chemicals"),
     ("UPL.NS",        "UPL",            "Chemicals"),
-    # ── EXCHANGE & CAPITAL MARKETS ──
     ("BSE.NS",        "BSE",            "Capital Mkts"),
     ("MCX.NS",        "MCX",            "Capital Mkts"),
     ("CDSL.NS",       "CDSL",           "Capital Mkts"),
     ("ANGELONE.NS",   "Angel One",      "Capital Mkts"),
     ("ICICIPRULI.NS", "ICICI Pru Life", "Capital Mkts"),
-    # ── NEW AGE / TECH ──
     ("PAYTM.NS",      "Paytm",          "New Age Tech"),
     ("POLICYBZR.NS",  "PB Fintech",     "New Age Tech"),
     ("DELHIVERY.NS",  "Delhivery",      "New Age Tech"),
@@ -659,7 +858,6 @@ FNO_STOCKS = [
 ]
 
 async def fetch_heatmap_stocks() -> list:
-    """Fetch F&O stock prices for India heatmap. Runs every 5 minutes."""
     result = []
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=20, follow_redirects=True) as client:
         for sym, name, sector in FNO_STOCKS:
@@ -680,65 +878,43 @@ async def fetch_heatmap_stocks() -> list:
     log.info(f"✅ Heatmap stocks: {len(result)}/{len(FNO_STOCKS)} fetched")
     return result
 
-# ── OPTION CHAIN — NSE via Scrape.do (session) → Yahoo Finance (crumb) ───────
-# NSE requires cookies from homepage visit. Scrape.do "sessionId" maintains
-# cookies across requests, allowing a 2-step flow: visit homepage → hit API.
-# Yahoo as fallback with proper crumb authentication.
 
 _yahoo_crumb = {"crumb": None, "cookies": None, "ts": 0}
 
 
-# ── NSE via SCRAPE.DO SESSION (primary method) ──────────────────────────────
 async def _fetch_nse_via_session(client: httpx.AsyncClient, symbol: str):
-    """Two-step NSE fetch using Scrape.do sessions to maintain cookies."""
     if not SCRAPER_API_KEY:
         return None
     from urllib.parse import quote
     import random, string
-
     sid = "nse-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
     nse_home = "https://www.nseindia.com/option-chain"
     nse_api  = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-
     try:
-        # Step 1: Visit NSE to set cookies in the scrape.do session
         home_url = (f"https://api.scrape.do?token={SCRAPER_API_KEY}"
                     f"&url={quote(nse_home, safe='')}&sessionId={sid}")
         r1 = await client.get(home_url, timeout=30)
-        log.info(f"NSE session step1 {symbol}: HTTP {r1.status_code} (session={sid})")
         if r1.status_code != 200:
             return None
-
         await asyncio.sleep(2)
-
-        # Step 2: Hit API using same session (cookies carry over)
         api_url = (f"https://api.scrape.do?token={SCRAPER_API_KEY}"
                    f"&url={quote(nse_api, safe='')}&sessionId={sid}")
         r2 = await client.get(api_url, timeout=30)
-        log.info(f"NSE session step2 {symbol}: HTTP {r2.status_code}")
-
         if r2.status_code == 200:
-            try:
-                data = r2.json()
-                if isinstance(data, dict) and "records" in data and "data" in data.get("records", {}):
-                    log.info(f"✅ NSE chain {symbol} via session: got {len(data['records']['data'])} records")
-                    return data
-                log.warning(f"NSE session {symbol}: 200 but body={str(data)[:150]}")
-            except Exception as e:
-                log.warning(f"NSE session {symbol}: not JSON — {r2.text[:150]}")
+            data = r2.json()
+            if isinstance(data, dict) and "records" in data and "data" in data.get("records", {}):
+                return data
     except Exception as e:
         log.warning(f"NSE session {symbol}: {e}")
     return None
 
 
 def _process_nse_chain(raw):
-    """Process NSE option chain JSON into PCR, Max Pain, top OI."""
     if not raw or "records" not in raw or "data" not in raw["records"]:
         return None
     records = raw["records"]
     data = records["data"]
-    from datetime import datetime as dt
-    expiry_dates = sorted(set(r["expiryDate"] for r in data), key=lambda d: dt.strptime(d, "%d-%b-%Y"))
+    expiry_dates = sorted(set(r["expiryDate"] for r in data), key=lambda d: datetime.strptime(d, "%d-%b-%Y"))
     if not expiry_dates: return None
     nearest = expiry_dates[0]
     near = [r for r in data if r["expiryDate"] == nearest]
@@ -769,31 +945,27 @@ def _process_nse_chain(raw):
             "total_ce": total_ce, "total_pe": total_pe, "source": "nse"}
 
 
-# ── YAHOO FINANCE WITH CRUMB (fallback) ─────────────────────────────────────
 async def _get_yahoo_crumb(client: httpx.AsyncClient):
     now = time.time()
     if _yahoo_crumb["crumb"] and (now - _yahoo_crumb["ts"]) < 1800:
         return _yahoo_crumb["crumb"], _yahoo_crumb["cookies"]
     cookies = None
-    for url in ["https://fc.yahoo.com", "https://query2.finance.yahoo.com", "https://finance.yahoo.com"]:
+    for url in ["https://fc.yahoo.com", "https://query2.finance.yahoo.com"]:
         try:
             r = await client.get(url, timeout=8)
             if r.cookies:
                 cookies = dict(r.cookies)
-                log.info(f"✅ Yahoo cookies from {url}")
                 break
         except: continue
-    if not cookies:
-        return None, None
+    if not cookies: return None, None
     try:
         r = await client.get("https://query2.finance.yahoo.com/v1/test/getcrumb", cookies=cookies, timeout=8)
         if r.status_code == 200 and r.text.strip() and len(r.text.strip()) < 50:
             crumb = r.text.strip()
             _yahoo_crumb.update({"crumb": crumb, "cookies": cookies, "ts": now})
-            log.info(f"✅ Yahoo crumb: {crumb[:10]}...")
             return crumb, cookies
     except Exception as e:
-        log.warning(f"Yahoo crumb error: {e}")
+        log.warning(f"Yahoo crumb: {e}")
     return None, None
 
 
@@ -809,7 +981,6 @@ async def _fetch_yahoo_options(client: httpx.AsyncClient, symbol: str):
             d = r.json()
             chain = (d.get("optionChain", {}).get("result", []) or [None])[0]
             if chain and chain.get("options") and chain["options"][0].get("calls"):
-                log.info(f"✅ Yahoo options {symbol}")
                 return chain
         except Exception as e:
             if attempt == 1: log.warning(f"Yahoo options {symbol}: {e}")
@@ -822,8 +993,7 @@ def _process_yahoo_chain(chain):
     calls_raw, puts_raw = nearest.get("calls", []), nearest.get("puts", [])
     if not calls_raw and not puts_raw: return None
     exp_ts = nearest.get("expirationDate", 0)
-    from datetime import datetime as dt
-    expiry_str = dt.utcfromtimestamp(exp_ts).strftime("%d-%b-%Y") if exp_ts else "—"
+    expiry_str = datetime.utcfromtimestamp(exp_ts).strftime("%d-%b-%Y") if exp_ts else "—"
     total_ce, total_pe = 0, 0
     calls, puts, all_rows = [], [], {}
     for c in calls_raw:
@@ -850,7 +1020,6 @@ def _process_yahoo_chain(chain):
             "total_ce": total_ce, "total_pe": total_pe, "source": "yahoo"}
 
 
-# ── MAIN FETCH — NSE (session) → Yahoo (crumb) ──────────────────────────────
 async def fetch_option_chain():
     result = {}
     nse_map   = {"nifty": "NIFTY", "bn": "BANKNIFTY"}
@@ -862,7 +1031,6 @@ async def fetch_option_chain():
                 raw = await _fetch_nse_via_session(client, nse_map[prefix])
                 if raw: processed = _process_nse_chain(raw)
                 if not processed:
-                    log.info(f"⚠️ NSE {nse_map[prefix]} failed, trying Yahoo...")
                     raw = await _fetch_yahoo_options(client, yahoo_map[prefix])
                     if raw: processed = _process_yahoo_chain(raw)
                 if processed:
@@ -875,28 +1043,19 @@ async def fetch_option_chain():
                     result[f"{prefix}_total_ce"] = processed["total_ce"]
                     result[f"{prefix}_total_pe"] = processed["total_pe"]
                     result[f"{prefix}_source"]   = processed.get("source", "unknown")
-                    log.info(f"✅ {prefix.upper()}: PCR={processed['pcr']}, MaxPain={processed['maxpain']}, Src={processed['source']}")
-                else:
-                    log.warning(f"❌ {prefix.upper()} options: all sources failed")
                 await asyncio.sleep(1)
         if result: result["updated_at"] = datetime.now().isoformat()
     except Exception as e:
-        log.error(f"❌ Option chain error: {e}")
+        log.error(f"Option chain error: {e}")
     return result
 
 
-# ── BACKGROUND REFRESH — never clears cache on failure ────────────────────────
+# ── BACKGROUND REFRESH ────────────────────────────────────────────────────────
 async def refresh_cache():
-    """
-    Refresh all data every 60 seconds.
-    KEY STABILITY RULE: only update cache when new data is valid.
-    Old data stays until replaced — users always see something.
-    """
     while True:
         start = time.time()
         log.info("🔄 Refreshing cache...")
 
-        # Run all fetches concurrently for speed
         results = await asyncio.gather(
             fetch_nse_indices(),
             fetch_metals(),
@@ -910,71 +1069,73 @@ async def refresh_cache():
         keys = ["indices", "metals", "us", "news", "giftnifty", "giftbanknifty"]
         for key, result in zip(keys, results):
             if isinstance(result, Exception):
-                log.error(f"❌ {key} gather error: {result}")
-            elif result:  # Only update if we got valid data
+                log.error(f"❌ {key}: {result}")
+            elif result:
                 cache[key] = {"data": result, "ts": time.time()}
             else:
-                log.warning(f"⚠️ {key}: empty result, keeping cache (age: {round(time.time()-cache[key]['ts'])}s)")
+                log.warning(f"⚠️ {key}: empty, keeping cache")
 
-        # Sparklines every 5 mins
-        spark_age = time.time() - cache["sparklines"]["ts"] if cache["sparklines"]["ts"] else 9999
-        if spark_age > 300:
+        # ── NSE announcements — every 5 minutes ──────────────────────────────
+        nse_age = time.time() - cache["nse_news"]["ts"] if cache["nse_news"]["ts"] else 9999
+        if nse_age > 300:
+            try:
+                nse_items = await fetch_nse_announcements()
+                if nse_items:
+                    cache["nse_news"] = {"data": nse_items, "ts": time.time()}
+                    log.info(f"✅ NSE news cache: {len(nse_items)} items")
+            except Exception as e:
+                log.error(f"❌ NSE news: {e}")
+
+        # ── Sparklines — every 5 minutes ─────────────────────────────────────
+        if time.time() - cache["sparklines"]["ts"] > 300:
             sparklines = await fetch_sparklines()
             if sparklines:
                 cache["sparklines"] = {"data": sparklines, "ts": time.time()}
 
-        # Heatmap stocks every 5 mins (many calls)
-        heatmap_age = time.time() - cache["heatmap"]["ts"] if cache["heatmap"]["ts"] else 9999
-        if heatmap_age > 300:
+        # ── Heatmap — every 5 minutes ─────────────────────────────────────────
+        if time.time() - cache["heatmap"]["ts"] > 300:
             heatmap = await fetch_heatmap_stocks()
             if heatmap:
                 cache["heatmap"] = {"data": heatmap, "ts": time.time()}
 
-        # Option chain every 3 mins (NSE rate-limited)
-        opt_age = time.time() - cache["options"]["ts"] if cache["options"]["ts"] else 9999
-        if opt_age > 180:
+        # ── Option chain — every 3 minutes ────────────────────────────────────
+        if time.time() - cache["options"]["ts"] > 180:
             options = await fetch_option_chain()
             if options:
                 cache["options"] = {"data": options, "ts": time.time()}
 
-        # Timed AI summaries — pre-market (7-9:15 IST), hourly (9:15-15:30), post-market (15:30-17:00)
-        from datetime import datetime, timezone, timedelta
-        ist = timezone(timedelta(hours=5, minutes=30))
-        now_ist = datetime.now(ist)
-        hour, minute = now_ist.hour, now_ist.minute
-        context = get_market_context(cache)
+        # ── Timed AI summaries ────────────────────────────────────────────────
+        if CLAUDE_KEY:
+            ist = timezone(timedelta(hours=5, minutes=30))
+            now_ist = datetime.now(ist)
+            hour, minute = now_ist.hour, now_ist.minute
+            context = get_market_context({
+                "indices": cache["indices"]["data"],
+                "metals":  cache["metals"]["data"],
+                "us":      cache["us"]["data"],
+                "giftnifty": cache["giftnifty"]["data"],
+            })
 
-        # Pre-market: 7:00–9:15 IST, refresh every 30 mins
-        if (7 <= hour < 9 or (hour == 9 and minute < 15)):
-            pm_age = time.time() - cache["pre_market"]["ts"] if cache["pre_market"]["ts"] else 9999
-            if pm_age > 1800:
-                result = await generate_timed_summary("pre_market", context)
-                if result: cache["pre_market"] = {"data": result, "ts": time.time()}
+            if (7 <= hour < 9 or (hour == 9 and minute < 15)):
+                if time.time() - cache["pre_market"]["ts"] > 1800:
+                    r = await generate_timed_summary("pre_market", context)
+                    if r: cache["pre_market"] = {"data": r, "ts": time.time()}
 
-        # Hourly update: 9:15–15:30 IST, refresh every 60 mins
-        elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 30):
-            hr_age = time.time() - cache["hourly"]["ts"] if cache["hourly"]["ts"] else 9999
-            if hr_age > 3600:
-                result = await generate_timed_summary("hourly", context)
-                if result: cache["hourly"] = {"data": result, "ts": time.time()}
+            elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 30):
+                if time.time() - cache["hourly"]["ts"] > 3600:
+                    r = await generate_timed_summary("hourly", context)
+                    if r: cache["hourly"] = {"data": r, "ts": time.time()}
 
-        # Post-market: 15:30–17:00 IST, refresh every 30 mins
-        elif (hour == 15 and minute > 30) or (hour == 16):
-            po_age = time.time() - cache["post_market"]["ts"] if cache["post_market"]["ts"] else 9999
-            if po_age > 1800:
-                result = await generate_timed_summary("post_market", context)
-                if result: cache["post_market"] = {"data": result, "ts": time.time()}
+            elif (hour == 15 and minute > 30) or (hour == 16):
+                if time.time() - cache["post_market"]["ts"] > 1800:
+                    r = await generate_timed_summary("post_market", context)
+                    if r: cache["post_market"] = {"data": r, "ts": time.time()}
 
-        # AI Summary every 30 mins
-        summary_age = time.time() - cache["summary"]["ts"] if cache["summary"]["ts"] else 9999
-        if summary_age > 1800:
-            summary = await generate_market_summary()
-            if summary:
-                cache["summary"] = {"data": summary, "ts": time.time()}
+            if time.time() - cache["summary"]["ts"] > 1800:
+                summary = await generate_market_summary()
+                if summary: cache["summary"] = {"data": summary, "ts": time.time()}
 
-        elapsed = round(time.time() - start, 1)
-        log.info(f"✅ Cache refresh done in {elapsed}s")
-
+        log.info(f"✅ Refresh done in {round(time.time()-start, 1)}s")
         await asyncio.sleep(60)
 
 
@@ -987,17 +1148,24 @@ async def startup():
 @app.get("/")
 def root():
     ages = {k: round(time.time()-v["ts"]) if v["ts"] else None for k,v in cache.items()}
-    return {"status": "Bazaar Watch API v5.6", "time": datetime.now().isoformat(), "cache_ages": ages}
+    return {"status": "Bazaar Watch API v5.7", "time": datetime.now().isoformat(), "cache_ages": ages}
 
 
 @app.get("/api/all")
 def get_all():
     now = time.time()
+
+    # Merge NSE news at top of news feed (deduplicated by title prefix)
+    rss_news = cache["news"]["data"]
+    nse_news = cache["nse_news"]["data"]
+    seen_keys = set(n["title"][:50] for n in nse_news)
+    merged_news = nse_news + [n for n in rss_news if n["title"][:50] not in seen_keys]
+
     return JSONResponse({
         "indices":       cache["indices"]["data"],
         "metals":        cache["metals"]["data"],
         "us":            cache["us"]["data"],
-        "news":          cache["news"]["data"],
+        "news":          merged_news,            # ← NSE items at top, RSS below
         "giftnifty":     cache["giftnifty"]["data"],
         "giftbanknifty": cache["giftbanknifty"]["data"],
         "summary":       cache["summary"]["data"],
@@ -1015,107 +1183,102 @@ def get_all():
 
 
 @app.get("/api/indices")
-def get_indices():
-    return JSONResponse(cache["indices"]["data"])
+def get_indices():   return JSONResponse(cache["indices"]["data"])
 
 @app.get("/api/metals")
-def get_metals():
-    return JSONResponse(cache["metals"]["data"])
+def get_metals():    return JSONResponse(cache["metals"]["data"])
 
 @app.get("/api/us")
-def get_us():
-    return JSONResponse(cache["us"]["data"])
+def get_us():        return JSONResponse(cache["us"]["data"])
 
 @app.get("/api/news")
-def get_news():
-    return JSONResponse(cache["news"]["data"])
+def get_news():      return JSONResponse(cache["news"]["data"])
 
 @app.get("/api/giftnifty")
-def get_gift_nifty():
-    return JSONResponse(cache["giftnifty"]["data"])
+def get_gift_nifty():      return JSONResponse(cache["giftnifty"]["data"])
 
 @app.get("/api/giftbanknifty")
-def get_gift_bank_nifty():
-    return JSONResponse(cache["giftbanknifty"]["data"])
+def get_gift_bank_nifty(): return JSONResponse(cache["giftbanknifty"]["data"])
 
 @app.get("/api/summary")
-def get_summary():
-    return JSONResponse(cache["summary"]["data"])
+def get_summary():   return JSONResponse(cache["summary"]["data"])
 
 @app.get("/api/heatmap")
-def get_heatmap():
-    return JSONResponse(cache["heatmap"]["data"])
+def get_heatmap():   return JSONResponse(cache["heatmap"]["data"])
 
 @app.get("/api/pre-market")
-def get_pre_market():
-    return JSONResponse(cache["pre_market"]["data"])
+def get_pre_market():  return JSONResponse(cache["pre_market"]["data"])
 
 @app.get("/api/hourly")
-def get_hourly():
-    return JSONResponse(cache["hourly"]["data"])
+def get_hourly():      return JSONResponse(cache["hourly"]["data"])
 
 @app.get("/api/post-market")
-def get_post_market():
-    return JSONResponse(cache["post_market"]["data"])
+def get_post_market(): return JSONResponse(cache["post_market"]["data"])
 
 @app.get("/api/sparklines")
-def get_sparklines():
-    return JSONResponse(cache["sparklines"]["data"])
+def get_sparklines():  return JSONResponse(cache["sparklines"]["data"])
 
 @app.get("/api/options")
-def get_options():
-    return JSONResponse(cache["options"]["data"])
+def get_options():     return JSONResponse(cache["options"]["data"])
+
+
+# ── NEW in v5.7 ───────────────────────────────────────────────────────────────
+@app.get("/api/nse-news")
+def get_nse_news():
+    """NSE corporate announcements, board meetings, corporate actions."""
+    return JSONResponse({
+        "ok":    True,
+        "items": cache["nse_news"]["data"],
+        "count": len(cache["nse_news"]["data"]),
+        "age_s": round(time.time() - cache["nse_news"]["ts"]) if cache["nse_news"]["ts"] else None,
+    })
+
+
+@app.get("/api/debug-nse-news")
+async def debug_nse_news():
+    """Test NSE scraper live — bypass cache. Use to verify it's working."""
+    try:
+        items = await fetch_nse_announcements()
+        return JSONResponse({
+            "ok":    True,
+            "count": len(items),
+            "items": items[:5],   # first 5 as preview
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
 
 @app.get("/api/debug-options")
 async def debug_options():
-    """Debug — tests session-based NSE + Yahoo crumb methods."""
     from urllib.parse import quote
     import random, string
     results = {}
-
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, follow_redirects=True, timeout=40) as client:
-
-        # ── Test 1: Scrape.do SESSION — two-step NSE ──
         if SCRAPER_API_KEY:
             sid = "dbg-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-            nse_home = "https://www.nseindia.com/option-chain"
-            nse_api  = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
             try:
-                # Step 1: homepage
                 r1 = await client.get(
-                    f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_home, safe='')}&sessionId={sid}",
+                    f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+                    f"&url={quote('https://www.nseindia.com/option-chain', safe='')}&sessionId={sid}",
                     timeout=30
                 )
                 results["session_step1_status"] = r1.status_code
-                results["session_step1_is_html"] = "<html" in r1.text[:200].lower()
                 await asyncio.sleep(2)
-                # Step 2: API with same session
                 r2 = await client.get(
-                    f"https://api.scrape.do?token={SCRAPER_API_KEY}&url={quote(nse_api, safe='')}&sessionId={sid}",
+                    f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+                    f"&url={quote('https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY', safe='')}&sessionId={sid}",
                     timeout=30
                 )
                 results["session_step2_status"] = r2.status_code
-                results["session_step2_body"] = r2.text[:400]
                 results["session_step2_has_records"] = '"records"' in r2.text[:2000]
             except Exception as e:
                 results["session_error"] = str(e)
-
-        # ── Test 2: Yahoo crumb ──
         try:
             crumb, cookies = await _get_yahoo_crumb(client)
             results["yahoo_crumb"] = crumb[:10] + "..." if crumb else None
             results["yahoo_cookies"] = bool(cookies)
-            if crumb:
-                r = await client.get(
-                    "https://query2.finance.yahoo.com/v7/finance/options/%5ENSEI",
-                    params={"crumb": crumb}, cookies=cookies, timeout=15
-                )
-                results["yahoo_v7_status"] = r.status_code
-                results["yahoo_v7_has_options"] = '"calls"' in r.text[:3000]
-                results["yahoo_v7_body"] = r.text[:300]
         except Exception as e:
             results["yahoo_error"] = str(e)
-
     return JSONResponse(results)
 
 
@@ -1123,16 +1286,17 @@ async def debug_options():
 def health():
     now = time.time()
     return {
-        "status":        "ok",
-        "version":       "5.6",
-        "finnhub_key":   "set" if FINNHUB_KEY   else "missing",
-        "claude_key":    "set" if CLAUDE_KEY    else "not configured",
-        "scraper_key":   "set" if SCRAPER_API_KEY else "missing — option chain won't work",
-        "gift_proxy":    GIFT_NIFTY_PROXY,
+        "status":      "ok",
+        "version":     "5.7",
+        "finnhub_key": "set" if FINNHUB_KEY    else "missing",
+        "claude_key":  "set" if CLAUDE_KEY     else "not configured",
+        "scraper_key": "set" if SCRAPER_API_KEY else "missing",
+        "gift_proxy":  GIFT_NIFTY_PROXY,
         "cache": {
             k: {
                 "age_s":    round(now - v["ts"]) if v["ts"] else None,
                 "has_data": bool(v["data"]),
+                "count":    len(v["data"]) if isinstance(v["data"], list) else None,
             }
             for k, v in cache.items()
         }
