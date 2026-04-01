@@ -26,7 +26,7 @@ GIFT_NIFTY_PROXY = os.getenv("GIFT_NIFTY_PROXY", "https://proxy-gift-nifty.onren
 CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY",  "")
 
-app = FastAPI(title="Bazaar Watch API v5.7")
+app = FastAPI(title="Bazaar Watch API v5.8")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -213,284 +213,287 @@ async def fetch_news() -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NSE CORPORATE ANNOUNCEMENTS SCRAPER  (NEW in v5.7)
+#  INDIA STOCKS NEWS — v5.8
+#  Sources (in priority order):
+#    1. BSE India API  — corporate filings, results, dividends, board meetings
+#    2. Google News RSS — recent India stock/corporate news aggregated
+#    3. Expanded RSS feeds — Livemint, NDTV Profit, BL, Zee Business, FE
 # ══════════════════════════════════════════════════════════════════════════════
 
-NSE_HEADERS = {
+BSE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
     ),
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer":         "https://www.nseindia.com/",
-    "Connection":      "keep-alive",
+    "Referer": "https://www.bseindia.com/",
+    "Origin":  "https://www.bseindia.com",
+    "Accept":  "application/json, text/plain, */*",
 }
 
-# In-memory NSE session cache (cookies are valid ~5 min)
-_nse_session_cookies: dict = {}
-_nse_session_ts: float = 0
-NSE_SESSION_TTL = 270  # refresh every 4.5 minutes
+# BSE announcement category IDs
+BSE_CATEGORIES = {
+    "30": "RESULT",        # Financial Results
+    "6":  "CORP ACTION",   # Dividend
+    "13": "CORP ACTION",   # Book Closure
+    "4":  "CORP ACTION",   # Board Meeting
+    "7":  "CORP ACTION",   # AGM / EGM
+    "43": "DEAL",          # Amalgamation / Merger
+    "60": "ALERT",         # SEBI / Regulatory
+    "48": "IPO",           # Listing / IPO
+    "-1": "NSE/BSE",       # All
+}
 
 
-async def _get_nse_cookies(client: httpx.AsyncClient) -> dict:
-    """Get fresh NSE session cookies by visiting the homepage first."""
-    global _nse_session_cookies, _nse_session_ts
-    now = time.time()
-    if _nse_session_cookies and (now - _nse_session_ts) < NSE_SESSION_TTL:
-        return _nse_session_cookies
-    try:
-        # Step 1 — hit homepage to receive cookies
-        r1 = await client.get("https://www.nseindia.com", timeout=12)
-        cookies = dict(r1.cookies)
-        # Step 2 — hit a secondary page to strengthen session
-        await asyncio.sleep(0.8)
-        r2 = await client.get(
-            "https://www.nseindia.com/market-data/live-equity-market",
-            cookies=cookies, timeout=10
-        )
-        cookies.update(dict(r2.cookies))
-        _nse_session_cookies = cookies
-        _nse_session_ts = now
-        log.info(f"✅ NSE session refreshed ({len(cookies)} cookies)")
-        return cookies
-    except Exception as e:
-        log.warning(f"NSE session init: {e}")
-        return {}
-
-
-async def _fetch_nse_api_direct(path: str) -> list:
+async def fetch_bse_announcements() -> list:
     """
-    Call NSE internal API directly (no proxy).
-    Works on most cloud servers — Render included.
-    Falls back to empty list on any error.
+    BSE corporate filings API — the most accessible Indian corporate news source.
+    Returns structured announcements: results, dividends, board meetings, mergers.
     """
-    url = f"https://www.nseindia.com{path}"
+    from datetime import datetime, timedelta
+    today     = datetime.now()
+    from_dt   = (today - timedelta(days=7)).strftime("%d%%2F%m%%2F%Y")
+    to_dt     = today.strftime("%d%%2F%m%%2F%Y")
+
+    url = (
+        f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+        f"?pageno=1&strCat=-1&strPrevDate={from_dt}&strScrip="
+        f"&strSearch=P&strToDate={to_dt}&strType=C&subcategory=-1"
+    )
+
     try:
-        async with httpx.AsyncClient(
-            headers=NSE_HEADERS, follow_redirects=True, timeout=18
-        ) as client:
-            cookies = await _get_nse_cookies(client)
-            r = await client.get(url, cookies=cookies, timeout=15)
-
-            if r.status_code in (401, 403):
-                # Force session refresh and retry once
-                global _nse_session_ts
-                _nse_session_ts = 0
-                cookies = await _get_nse_cookies(client)
-                r = await client.get(url, cookies=cookies, timeout=15)
-
+        async with httpx.AsyncClient(headers=BSE_HEADERS, timeout=18, follow_redirects=True) as client:
+            r = await client.get(url)
             if r.status_code != 200:
-                log.warning(f"NSE direct {path}: HTTP {r.status_code}")
+                log.warning(f"BSE API HTTP {r.status_code}")
+                return []
+            data  = r.json()
+            table = data.get("Table", [])
+            if not table:
+                log.warning("BSE API: empty Table")
                 return []
 
-            payload = r.json()
-            if isinstance(payload, list):
-                return payload
-            if isinstance(payload, dict):
-                for key in ("data", "announcements", "results"):
-                    if key in payload and isinstance(payload[key], list):
-                        return payload[key]
-            return []
+            results = []
+            seen    = set()
+            for item in table[:100]:
+                company  = (item.get("SLONGNAME") or item.get("SCRIP_CD") or "").strip()
+                headline = (item.get("HEADLINE") or "").strip()
+                subcat   = (item.get("SUBCATNAME") or "").strip()
+                scrip    = str(item.get("SCRIP_CD") or "")
+                newsid   = str(item.get("NEWSID") or "")
+                diss_dt  = (item.get("DissemDT") or "").strip()
+
+                if not company or not headline:
+                    continue
+
+                # Build readable title
+                detail   = subcat if subcat and subcat != headline else ""
+                title    = f"{company}: {headline}"
+                if detail:
+                    title += f" — {detail}"
+
+                # Deduplicate
+                key = title[:60].lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                # BSE link to announcement
+                attach = item.get("ATTACHMENTNAME", "")
+                if attach:
+                    link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}"
+                else:
+                    link = (f"https://www.bseindia.com/corporates/Ann.html"
+                            f"?scrip={scrip}&head={headline}&newsid={newsid}")
+
+                # Parse timestamp
+                ts_str = ""
+                try:
+                    dt = datetime.strptime(diss_dt, "%d %b %Y %H:%M:%S")
+                    ts_str = dt.strftime("%Y-%m-%dT%H:%M:%S") + "+05:30"
+                except Exception:
+                    ts_str = diss_dt
+
+                # Classify
+                cat_id  = str(item.get("CATEGORYID") or "-1")
+                tag     = BSE_CATEGORIES.get(cat_id, _classify_by_text(headline + " " + subcat))
+
+                results.append({
+                    "title":    title,
+                    "source":   "BSE India",
+                    "link":     link,
+                    "time":     ts_str,
+                    "category": tag,
+                    "symbol":   item.get("SCRIP_CD", ""),
+                })
+
+            log.info(f"✅ BSE API: {len(results)} announcements")
+            return results
+
     except Exception as e:
-        log.warning(f"NSE direct {path}: {e}")
+        log.warning(f"BSE API: {e}")
         return []
 
 
-async def _fetch_nse_api_via_scraperapi(path: str) -> list:
+async def fetch_google_news_india() -> list:
     """
-    Fallback: route NSE API calls through Scrape.do session.
-    Only used if SCRAPER_API_KEY is set and direct call failed.
+    Google News RSS — highly reliable, aggregates from all Indian financial sources.
+    Returns recent India stock/corporate news.
     """
-    if not SCRAPER_API_KEY:
-        return []
-    from urllib.parse import quote
-    import random, string
-    sid = "nse-ann-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-    nse_home = "https://www.nseindia.com/"
-    nse_url  = f"https://www.nseindia.com{path}"
+    queries = [
+        "India+stock+results+quarterly+earnings+NSE+BSE",
+        "India+dividend+bonus+split+buyback+stock+announcement",
+        "India+corporate+merger+acquisition+deal+stock",
+        "SEBI+India+stock+market+corporate+filing",
+    ]
+    base = "https://news.google.com/rss/search?hl=en-IN&gl=IN&ceid=IN:en&q="
+    items = []
+    seen  = set()
+
     try:
-        async with httpx.AsyncClient(timeout=35) as client:
-            # Step 1: warm session
-            await client.get(
-                f"https://api.scrape.do?token={SCRAPER_API_KEY}"
-                f"&url={quote(nse_home, safe='')}&sessionId={sid}",
-                timeout=25
-            )
-            await asyncio.sleep(1.5)
-            # Step 2: hit API
-            r = await client.get(
-                f"https://api.scrape.do?token={SCRAPER_API_KEY}"
-                f"&url={quote(nse_url, safe='')}&sessionId={sid}",
-                timeout=25
-            )
-            if r.status_code != 200:
-                return []
-            payload = r.json()
-            if isinstance(payload, list):
-                return payload
-            if isinstance(payload, dict):
-                for key in ("data", "announcements"):
-                    if key in payload and isinstance(payload[key], list):
-                        return payload[key]
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            for q in queries:
+                try:
+                    r    = await client.get(base + q, timeout=10)
+                    feed = feedparser.parse(r.text)
+                    for e in feed.entries[:12]:
+                        title = (e.get("title") or "").strip()
+                        if not title or title[:50] in seen:
+                            continue
+                        seen.add(title[:50])
+                        # Google News wraps source in title as "Title - Source"
+                        src = "Google News"
+                        if " - " in title:
+                            parts = title.rsplit(" - ", 1)
+                            title = parts[0].strip()
+                            src   = parts[1].strip()
+                        items.append({
+                            "title":    title,
+                            "source":   src,
+                            "link":     e.get("link", ""),
+                            "time":     e.get("published", ""),
+                            "category": _classify_by_text(title),
+                            "symbol":   "",
+                        })
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    log.warning(f"Google News query '{q[:30]}': {e}")
+
     except Exception as e:
-        log.warning(f"NSE scrape.do {path}: {e}")
-    return []
+        log.warning(f"Google News: {e}")
+
+    log.info(f"✅ Google News India: {len(items)} items")
+    return items
 
 
-def _classify_announcement(subject: str) -> str:
-    """Map announcement subject to a display tag."""
-    s = (subject or "").lower()
-    if any(k in s for k in ("dividend", "bonus", "split", "buyback", "rights")):
+def _classify_by_text(text: str) -> str:
+    """Classify a news item by keywords in its text."""
+    t = (text or "").lower()
+    if any(k in t for k in ("dividend", "bonus share", "stock split", "buyback", "rights issue", "ex-date")):
         return "CORP ACTION"
-    if any(k in s for k in ("result", "profit", "revenue", "financial", "quarterly",
-                             "q1", "q2", "q3", "q4", "annual", "earnings")):
+    if any(k in t for k in ("result", "profit", "revenue", "ebitda", "pat", "quarterly", "earnings",
+                             "q1", "q2", "q3", "q4", "annual result", "net loss")):
         return "RESULT"
-    if any(k in s for k in ("ipo", "listing", "allotment", "offer for sale", "ofs")):
+    if any(k in t for k in ("ipo", "listing", "allotment", "offer for sale", "ofs", "sme ipo")):
         return "IPO"
-    if any(k in s for k in ("sebi", "penalty", "circuit", "ban", "order",
-                             "investigation", "show cause", "suspension")):
+    if any(k in t for k in ("sebi", "penalty", "order", "circuit", "ban", "suspension",
+                             "investigation", "show cause", "fraud")):
         return "ALERT"
-    if any(k in s for k in ("merger", "acquisition", "stake", "deal", "mou",
-                             "agreement", "joint venture", "takeover")):
+    if any(k in t for k in ("merger", "acquisition", "acquires", "stake sale", "deal",
+                             "mou", "agreement", "joint venture", "takeover", "block deal", "bulk deal")):
         return "DEAL"
-    if any(k in s for k in ("fii", "fpi", "dii", "institutional", "bulk deal", "block deal")):
+    if any(k in t for k in ("fii", "fpi", "dii", "institutional", "foreign investor")):
         return "FII/DII"
     return "NSE/BSE"
 
 
-def _parse_nse_date(date_str: str) -> str:
-    """Parse NSE date formats to ISO string with IST offset."""
-    if not date_str:
-        return ""
-    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y"):
+async def fetch_india_stock_rss() -> list:
+    """
+    Extended Indian financial RSS feeds — specific to stocks/corporate news.
+    Supplements BSE + Google News with source-specific feeds.
+    """
+    feeds = [
+        # MoneyControl — specific feeds for stocks
+        ("https://www.moneycontrol.com/rss/results.xml",          "Moneycontrol"),
+        ("https://www.moneycontrol.com/rss/corporateactions.xml", "Moneycontrol"),
+        ("https://www.moneycontrol.com/rss/latestnews.xml",       "Moneycontrol"),
+        ("https://www.moneycontrol.com/rss/marketreports.xml",    "Moneycontrol"),
+        # Livemint
+        ("https://www.livemint.com/rss/companies",                "Livemint"),
+        ("https://www.livemint.com/rss/markets",                  "Livemint"),
+        ("https://www.livemint.com/rss/money",                    "Livemint"),
+        # The Hindu BusinessLine
+        ("https://www.thehindubusinessline.com/markets/?service=rss",   "BusinessLine"),
+        ("https://www.thehindubusinessline.com/companies/?service=rss", "BusinessLine"),
+        # NDTV Profit
+        ("https://www.ndtv.com/business/rss",                     "NDTV Profit"),
+        # Financial Express
+        ("https://www.financialexpress.com/market/rss",           "Financial Express"),
+        ("https://www.financialexpress.com/industry/rss",         "Financial Express"),
+        # Zee Business
+        ("https://www.zeebiz.com/rss",                            "Zee Business"),
+        # Economic Times — more specific
+        ("https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2143736.cms", "ET Stocks"),
+        ("https://economictimes.indiatimes.com/markets/stocks/earnings/rssfeeds/2143759.cms", "ET Earnings"),
+    ]
+    items = []
+    seen  = set()
+
+    for url, source in feeds:
         try:
-            dt = datetime.strptime(date_str.strip(), fmt)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S") + "+05:30"
-        except ValueError:
-            continue
-    return date_str  # return raw if unparseable
+            feed = feedparser.parse(url)
+            for e in feed.entries[:10]:
+                title = (e.get("title") or "").strip()
+                if not title or title[:50] in seen:
+                    continue
+                seen.add(title[:50])
+                items.append({
+                    "title":    title,
+                    "source":   source,
+                    "link":     e.get("link", ""),
+                    "time":     e.get("published", ""),
+                    "category": _classify_by_text(title),
+                    "symbol":   "",
+                })
+        except Exception as e:
+            log.warning(f"India RSS {source}: {e}")
+
+    log.info(f"✅ India stock RSS: {len(items)} items from {len(feeds)} feeds")
+    return items
 
 
-async def fetch_nse_announcements() -> list:
+async def fetch_india_stocks_news() -> list:
     """
-    Fetch NSE corporate announcements for the last 7 days.
-    Tries direct call first; falls back to Scrape.do if configured.
-    Returns normalised list of news items.
+    Master function — runs all 3 sources concurrently, merges and deduplicates.
+    BSE API items go first (most authoritative), then Google News, then RSS.
     """
-    today     = datetime.now()
-    from_date = (today - timedelta(days=7)).strftime("%d-%m-%Y")
-    to_date   = today.strftime("%d-%m-%Y")
-
-    # ── 1. Corporate announcements (results, AGM, SEBI, board outcomes)
-    ann_path = (
-        f"/api/corporate-announcements?index=equities"
-        f"&from_date={from_date}&to_date={to_date}"
+    results = await asyncio.gather(
+        fetch_bse_announcements(),
+        fetch_google_news_india(),
+        fetch_india_stock_rss(),
+        return_exceptions=True
     )
-    ann_raw = await _fetch_nse_api_direct(ann_path)
-    if not ann_raw:
-        log.info("NSE direct announcements failed — trying Scrape.do")
-        ann_raw = await _fetch_nse_api_via_scraperapi(ann_path)
 
-    # ── 2. Corporate actions (dividends, splits, bonuses, buybacks)
-    act_path = (
-        f"/api/corporates-corporateActions?index=equities"
-        f"&from_date={from_date}&to_date={to_date}"
-    )
-    act_raw = await _fetch_nse_api_direct(act_path)
-    if not act_raw:
-        act_raw = await _fetch_nse_api_via_scraperapi(act_path)
+    bse_items    = results[0] if not isinstance(results[0], Exception) else []
+    google_items = results[1] if not isinstance(results[1], Exception) else []
+    rss_items    = results[2] if not isinstance(results[2], Exception) else []
 
-    # ── 3. Board meetings (upcoming)
-    bm_path = "/api/corporate-board-meetings?index=equities"
-    bm_raw  = await _fetch_nse_api_direct(bm_path)
-    if not bm_raw:
-        bm_raw = await _fetch_nse_api_via_scraperapi(bm_path)
-
-    results = []
-
-    # Normalise announcements
-    for item in ann_raw[:80]:
-        subject = (item.get("subject") or item.get("desc") or "").strip()
-        symbol  = (item.get("symbol") or "").strip()
-        company = (item.get("comp") or item.get("companyName") or symbol).strip()
-        an_time = item.get("an_dt") or item.get("bm_date") or ""
-
-        if not subject:
-            continue
-
-        headline = f"{company}: {subject}" if company and company != subject else subject
-
-        results.append({
-            "title":    headline,
-            "source":   "NSE India",
-            "link":     "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-            "time":     _parse_nse_date(an_time),
-            "category": _classify_announcement(subject),
-            "symbol":   symbol,
-        })
-
-    # Normalise corporate actions
-    for item in act_raw[:40]:
-        symbol  = (item.get("symbol") or "").strip()
-        company = (item.get("comp") or symbol).strip()
-        purpose = (item.get("purpose") or item.get("subject") or "").strip()
-        exdate  = (item.get("exDate") or item.get("ex_date") or "").strip()
-
-        if not purpose:
-            continue
-
-        headline = f"{company}: {purpose}"
-        if exdate:
-            headline += f" — Ex-date {exdate}"
-
-        results.append({
-            "title":    headline,
-            "source":   "NSE India",
-            "link":     "https://www.nseindia.com/companies-listing/corporate-filings-corporate-actions",
-            "time":     _parse_nse_date(exdate),
-            "category": _classify_announcement(purpose),
-            "symbol":   symbol,
-        })
-
-    # Normalise board meetings
-    for item in bm_raw[:30]:
-        symbol  = (item.get("symbol") or "").strip()
-        company = (item.get("companyName") or symbol).strip()
-        purpose = (item.get("purpose") or "").strip()
-        bm_date = (item.get("meeting_date") or item.get("bm_date") or "").strip()
-
-        if not purpose:
-            continue
-
-        headline = f"{company}: Board Meeting — {purpose}"
-        if bm_date:
-            headline += f" (on {bm_date})"
-
-        results.append({
-            "title":    headline,
-            "source":   "NSE India",
-            "link":     "https://www.nseindia.com/companies-listing/corporate-filings-board-meetings",
-            "time":     _parse_nse_date(bm_date),
-            "category": "RESULT" if "result" in purpose.lower() else "CORP ACTION",
-            "symbol":   symbol,
-        })
-
-    # Deduplicate by first 60 chars of title
-    seen, unique = set(), []
-    for r in results:
-        key = r["title"][:60].lower()
-        if key not in seen:
+    # Merge — BSE first, deduplicate by title prefix
+    seen, merged = set(), []
+    for item in (bse_items + google_items + rss_items):
+        key = (item.get("title") or "")[:55].lower().strip()
+        if key and key not in seen:
             seen.add(key)
-            unique.append(r)
+            merged.append(item)
 
-    log.info(f"✅ NSE announcements: {len(unique)} items "
-             f"(ann={len(ann_raw)}, act={len(act_raw)}, bm={len(bm_raw)})")
-    return unique
+    log.info(
+        f"✅ India stocks news total: {len(merged)} "
+        f"(BSE={len(bse_items)}, Google={len(google_items)}, RSS={len(rss_items)})"
+    )
+    return merged
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  REST OF ORIGINAL FUNCTIONS (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 #  REST OF ORIGINAL FUNCTIONS (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1075,16 +1078,16 @@ async def refresh_cache():
             else:
                 log.warning(f"⚠️ {key}: empty, keeping cache")
 
-        # ── NSE announcements — every 5 minutes ──────────────────────────────
+        # ── India stocks news — every 5 minutes ─────────────────────────────
         nse_age = time.time() - cache["nse_news"]["ts"] if cache["nse_news"]["ts"] else 9999
         if nse_age > 300:
             try:
-                nse_items = await fetch_nse_announcements()
-                if nse_items:
-                    cache["nse_news"] = {"data": nse_items, "ts": time.time()}
-                    log.info(f"✅ NSE news cache: {len(nse_items)} items")
+                india_items = await fetch_india_stocks_news()
+                if india_items:
+                    cache["nse_news"] = {"data": india_items, "ts": time.time()}
+                    log.info(f"✅ India stocks news cache: {len(india_items)} items")
             except Exception as e:
-                log.error(f"❌ NSE news: {e}")
+                log.error(f"❌ India stocks news: {e}")
 
         # ── Sparklines — every 5 minutes ─────────────────────────────────────
         if time.time() - cache["sparklines"]["ts"] > 300:
@@ -1148,7 +1151,7 @@ async def startup():
 @app.get("/")
 def root():
     ages = {k: round(time.time()-v["ts"]) if v["ts"] else None for k,v in cache.items()}
-    return {"status": "Bazaar Watch API v5.7", "time": datetime.now().isoformat(), "cache_ages": ages}
+    return {"status": "Bazaar Watch API v5.8", "time": datetime.now().isoformat(), "cache_ages": ages}
 
 
 @app.get("/api/all")
@@ -1236,13 +1239,24 @@ def get_nse_news():
 
 @app.get("/api/debug-nse-news")
 async def debug_nse_news():
-    """Test NSE scraper live — bypass cache. Use to verify it's working."""
+    """
+    Test all India stocks news sources live — bypasses cache.
+    Shows count from each source: BSE API, Google News, RSS feeds.
+    """
     try:
-        items = await fetch_nse_announcements()
+        bse    = await fetch_bse_announcements()
+        google = await fetch_google_news_india()
+        rss    = await fetch_india_stock_rss()
+        merged = await fetch_india_stocks_news()
         return JSONResponse({
-            "ok":    True,
-            "count": len(items),
-            "items": items[:5],   # first 5 as preview
+            "ok":           True,
+            "total":        len(merged),
+            "bse_count":    len(bse),
+            "google_count": len(google),
+            "rss_count":    len(rss),
+            "bse_sample":   bse[:3],
+            "google_sample":google[:3],
+            "rss_sample":   rss[:3],
         })
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
@@ -1287,7 +1301,7 @@ def health():
     now = time.time()
     return {
         "status":      "ok",
-        "version":     "5.7",
+        "version":     "5.8",
         "finnhub_key": "set" if FINNHUB_KEY    else "missing",
         "claude_key":  "set" if CLAUDE_KEY     else "not configured",
         "scraper_key": "set" if SCRAPER_API_KEY else "missing",
