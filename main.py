@@ -1,12 +1,13 @@
 """
-Bazaar Watch — Backend API v5.7
+Bazaar Watch — Backend API v6.1
 ========================================
 Changes from v5.6:
-  - NSE corporate announcements scraper added
-  - /api/nse-news endpoint
-  - NSE news merged into /api/all response
-  - NSE news refreshed every 5 minutes in background
-  - Uses direct httpx first, Scrape.do session as fallback
+  - BSE + Google News + RSS India stocks news
+  - ADMIN_KEY protected summary + article endpoints
+  - Article CRUD: POST/DELETE /api/admin/article
+  - File persistence: articles + summary survive restarts
+  - CORS fixed for local file:// admin panel
+  - POST/DELETE methods allowed
 """
 
 import os, time, asyncio, logging, threading
@@ -257,7 +258,7 @@ async def fetch_news() -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INDIA STOCKS NEWS — v5.8
+#  INDIA STOCKS NEWS — v6.1
 #  Sources (in priority order):
 #    1. BSE India API  — corporate filings, results, dividends, board meetings
 #    2. Google News RSS — recent India stock/corporate news aggregated
@@ -1217,7 +1218,7 @@ async def startup():
 @app.get("/")
 def root():
     ages = {k: round(time.time()-v["ts"]) if v["ts"] else None for k,v in cache.items()}
-    return {"status": "Bazaar Watch API v5.8", "time": datetime.now().isoformat(), "cache_ages": ages}
+    return {"status": "Bazaar Watch API v6.1", "time": datetime.now().isoformat(), "cache_ages": ages}
 
 
 @app.get("/api/all")
@@ -1416,7 +1417,7 @@ def get_sparklines():  return JSONResponse(cache["sparklines"]["data"])
 def get_options():     return JSONResponse(cache["options"]["data"])
 
 
-# ── NEW in v5.7 ───────────────────────────────────────────────────────────────
+# ── ARTICLE + SUMMARY ENDPOINTS ────────────────────────────────────────────────────
 @app.get("/api/nse-news")
 def get_nse_news():
     """NSE corporate announcements, board meetings, corporate actions."""
