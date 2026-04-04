@@ -31,9 +31,10 @@ ADMIN_KEY        = os.getenv("ADMIN_KEY",        "")   # Set this in Render envi
 app = FastAPI(title="Bazaar Watch API v5.9")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_origins=["*", "null"],   # "null" allows requests from local file:// — needed for admin panel
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
 # ── CACHE — never wiped, only updated on success ──────────────────────────────
