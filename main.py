@@ -28,7 +28,7 @@ CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY",  "")
 ADMIN_KEY        = os.getenv("ADMIN_KEY",        "")   # Set this in Render environment vars
 
-app = FastAPI(title="Bazaar Watch API v5.9")
+app = FastAPI(title="Bazaar Watch API v6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*", "null"],   # "null" allows requests from local file:// — needed for admin panel
@@ -44,6 +44,7 @@ cache = {
     "us":            {"data": {}, "ts": 0},
     "news":          {"data": [], "ts": 0},
     "nse_news":      {"data": [], "ts": 0},   # ← NEW: NSE corporate announcements
+    "articles":      {"data": [], "ts": 0},   # ← NEW: Published articles
     "giftnifty":     {"data": {}, "ts": 0},
     "giftbanknifty": {"data": {}, "ts": 0},
     "summary":       {"data": {}, "ts": 0},
@@ -1202,6 +1203,7 @@ def get_all():
         "post_market":   cache["post_market"]["data"],
         "sparklines":    cache["sparklines"]["data"],
         "options":       cache["options"]["data"],
+        "articles":      cache["articles"]["data"],
         "timestamp":     datetime.now().isoformat(),
         "cache_age": {
             k: round(now - v["ts"]) if v["ts"] else None
@@ -1269,6 +1271,87 @@ def clear_summary(key: str):
     cache["summary"] = {"data": {}, "ts": 0}
     log.info("Summary cleared")
     return {"ok": True}
+
+
+# ── ARTICLE ENDPOINTS ─────────────────────────────────────────────────────────
+
+class ArticlePayload(BaseModel):
+    key:      str
+    id:       str = ""          # empty = new article
+    title:    str
+    category: str = "stock"     # "stock" | "commodity"
+    ticker:   str = ""
+    tvSymbol: str = ""
+    author:   str = "Bazaar Watch Research"
+    body:     str
+
+@app.post("/api/admin/article")
+def save_article(payload: ArticlePayload):
+    """Create or update a published article."""
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=503, detail="ADMIN_KEY not configured on server")
+    if payload.key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    if not payload.title.strip():
+        raise HTTPException(status_code=400, detail="Title required")
+    if not payload.body.strip():
+        raise HTTPException(status_code=400, detail="Body required")
+
+    articles = list(cache["articles"]["data"])
+
+    if payload.id:
+        # Update existing
+        idx = next((i for i, a in enumerate(articles) if a.get("id") == payload.id), -1)
+        if idx >= 0:
+            articles[idx] = {
+                **articles[idx],
+                "title":     payload.title.strip(),
+                "category":  payload.category,
+                "ticker":    payload.ticker.strip().upper(),
+                "tvSymbol":  payload.tvSymbol.strip(),
+                "author":    payload.author.strip(),
+                "body":      payload.body.strip(),
+                "updatedAt": datetime.now().isoformat(),
+            }
+            log.info(f"✅ Article updated: {payload.title[:40]}")
+        else:
+            raise HTTPException(status_code=404, detail="Article not found")
+    else:
+        # New article — prepend so newest is first
+        import time as _time
+        new_id = f"art_{int(_time.time() * 1000)}"
+        articles.insert(0, {
+            "id":       new_id,
+            "title":    payload.title.strip(),
+            "category": payload.category,
+            "ticker":   payload.ticker.strip().upper(),
+            "tvSymbol": payload.tvSymbol.strip(),
+            "author":   payload.author.strip(),
+            "body":     payload.body.strip(),
+            "date":     datetime.now().isoformat(),
+            "updatedAt":datetime.now().isoformat(),
+        })
+        log.info(f"✅ Article created: {payload.title[:40]} (id={new_id})")
+
+    cache["articles"] = {"data": articles, "ts": time.time()}
+    return {"ok": True, "count": len(articles)}
+
+
+@app.delete("/api/admin/article")
+def delete_article(key: str, id: str):
+    """Delete an article by id."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    articles = [a for a in cache["articles"]["data"] if a.get("id") != id]
+    cache["articles"] = {"data": articles, "ts": time.time()}
+    log.info(f"✅ Article deleted: {id}")
+    return {"ok": True, "count": len(articles)}
+
+
+@app.get("/api/articles")
+def get_articles():
+    """Public endpoint — returns all published articles."""
+    return JSONResponse(cache["articles"]["data"])
 
 @app.get("/api/heatmap")
 def get_heatmap():   return JSONResponse(cache["heatmap"]["data"])
@@ -1365,11 +1448,12 @@ def health():
     now = time.time()
     return {
         "status":      "ok",
-        "version":     "5.9",
+        "version":     "6.0",
         "finnhub_key": "set" if FINNHUB_KEY    else "missing",
         "claude_key":  "set" if CLAUDE_KEY     else "not configured",
         "scraper_key": "set" if SCRAPER_API_KEY else "missing",
         "admin_key":   "set" if ADMIN_KEY      else "NOT SET — admin panel won't work",
+        "articles":    len(cache["articles"]["data"]),
         "gift_proxy":  GIFT_NIFTY_PROXY,
         "cache": {
             k: {
