@@ -28,7 +28,7 @@ CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY",  "")
 ADMIN_KEY        = os.getenv("ADMIN_KEY",        "")   # Set this in Render environment vars
 
-app = FastAPI(title="Bazaar Watch API v6.0")
+app = FastAPI(title="Bazaar Watch API v6.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*", "null"],   # "null" allows requests from local file:// — needed for admin panel
@@ -55,6 +55,45 @@ cache = {
     "sparklines":    {"data": {}, "ts": 0},
     "options":       {"data": {}, "ts": 0},
 }
+
+# ── FILE PERSISTENCE — articles + summary survive restarts ───────────────────
+import json as _json, os as _os
+
+DATA_DIR = _os.path.join(_os.path.dirname(__file__), 'data')
+_os.makedirs(DATA_DIR, exist_ok=True)
+
+def _persist_path(key: str) -> str:
+    return _os.path.join(DATA_DIR, f'{key}.json')
+
+def _load_persisted(key: str):
+    """Load data from disk on startup. Returns None if file missing."""
+    try:
+        path = _persist_path(key)
+        if _os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = _json.load(f)
+                log.info(f"✅ Loaded persisted {key} from disk")
+                return data
+    except Exception as e:
+        log.warning(f"Could not load persisted {key}: {e}")
+    return None
+
+def _save_persisted(key: str, data) -> None:
+    """Write data to disk immediately after any save/update."""
+    try:
+        path = _persist_path(key)
+        with open(path, 'w', encoding='utf-8') as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Could not persist {key}: {e}")
+
+def _init_persisted_cache():
+    """Called at startup — restores articles + summary from disk if available."""
+    for key in ('articles', 'summary'):
+        data = _load_persisted(key)
+        if data is not None:
+            cache[key] = {'data': data, 'ts': time.time()}
+            log.info(f"✅ Restored {key} from disk: {len(data) if isinstance(data, list) else 'dict'}")
 
 # ── YAHOO FINANCE — core data fetcher ────────────────────────────────────────
 YAHOO_HEADERS = {
@@ -1170,6 +1209,7 @@ async def refresh_cache():
 
 @app.on_event("startup")
 async def startup():
+    _init_persisted_cache()   # restore articles + summary from disk
     asyncio.create_task(refresh_cache())
 
 
@@ -1259,6 +1299,7 @@ def post_summary(payload: SummaryPayload):
         "source":       "manual",
     }
     cache["summary"] = {"data": data, "ts": time.time()}
+    _save_persisted("summary", data)   # write to disk immediately
     log.info(f"✅ Manual summary pushed ({len(payload.text)} chars, session={payload.session})")
     return {"ok": True, "chars": len(payload.text), "ts": data["generated_at"]}
 
@@ -1269,6 +1310,7 @@ def clear_summary(key: str):
     if not ADMIN_KEY or key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin key")
     cache["summary"] = {"data": {}, "ts": 0}
+    _save_persisted("summary", {})
     log.info("Summary cleared")
     return {"ok": True}
 
@@ -1334,6 +1376,7 @@ def save_article(payload: ArticlePayload):
         log.info(f"✅ Article created: {payload.title[:40]} (id={new_id})")
 
     cache["articles"] = {"data": articles, "ts": time.time()}
+    _save_persisted("articles", articles)   # write to disk immediately
     return {"ok": True, "count": len(articles)}
 
 
@@ -1344,6 +1387,7 @@ def delete_article(key: str, id: str):
         raise HTTPException(status_code=401, detail="Invalid admin key")
     articles = [a for a in cache["articles"]["data"] if a.get("id") != id]
     cache["articles"] = {"data": articles, "ts": time.time()}
+    _save_persisted("articles", articles)   # update disk immediately
     log.info(f"✅ Article deleted: {id}")
     return {"ok": True, "count": len(articles)}
 
@@ -1448,7 +1492,7 @@ def health():
     now = time.time()
     return {
         "status":      "ok",
-        "version":     "6.0",
+        "version":     "6.1",
         "finnhub_key": "set" if FINNHUB_KEY    else "missing",
         "claude_key":  "set" if CLAUDE_KEY     else "not configured",
         "scraper_key": "set" if SCRAPER_API_KEY else "missing",
