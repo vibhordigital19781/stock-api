@@ -1009,8 +1009,8 @@ def _process_nse_chain(raw):
     maxpain = min(strike_map, key=strike_map.get) if strike_map else None
     pcr = round(total_pe / total_ce, 2) if total_ce > 0 else None
     return {"pcr": pcr, "maxpain": maxpain, "expiry": nearest, "spot": records.get("underlyingValue"),
-            "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
-            "top_put_oi": sorted(puts, key=lambda x: x["oi"], reverse=True)[:3],
+            "call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True),
+            "put_oi":  sorted(puts,  key=lambda x: x["oi"], reverse=True),
             "total_ce": total_ce, "total_pe": total_pe, "source": "nse"}
 
 
@@ -1084,8 +1084,8 @@ def _process_yahoo_chain(chain):
     return {"pcr": round(total_pe / total_ce, 2) if total_ce else None,
             "maxpain": min(strike_pain, key=strike_pain.get) if strike_pain else None,
             "expiry": expiry_str, "spot": chain.get("quote", {}).get("regularMarketPrice"),
-            "top_call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True)[:3],
-            "top_put_oi": sorted(puts, key=lambda x: x["oi"], reverse=True)[:3],
+            "call_oi": sorted(calls, key=lambda x: x["oi"], reverse=True),
+            "put_oi":  sorted(puts,  key=lambda x: x["oi"], reverse=True),
             "total_ce": total_ce, "total_pe": total_pe, "source": "yahoo"}
 
 
@@ -1107,8 +1107,8 @@ async def fetch_option_chain():
                     result[f"{prefix}_maxpain"]  = processed["maxpain"]
                     result[f"{prefix}_expiry"]   = processed["expiry"]
                     result[f"{prefix}_spot"]     = processed["spot"]
-                    result[f"{prefix}_call_oi"]  = processed["top_call_oi"]
-                    result[f"{prefix}_put_oi"]   = processed["top_put_oi"]
+                    result[f"{prefix}_call_oi"]  = processed["call_oi"]
+                    result[f"{prefix}_put_oi"]   = processed["put_oi"]
                     result[f"{prefix}_total_ce"] = processed["total_ce"]
                     result[f"{prefix}_total_pe"] = processed["total_pe"]
                     result[f"{prefix}_source"]   = processed.get("source", "unknown")
