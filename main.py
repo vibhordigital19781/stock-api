@@ -13,7 +13,8 @@ import os, time, asyncio, logging, threading
 from datetime import datetime, timedelta, timezone
 import httpx
 import feedparser
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -25,8 +26,9 @@ FINNHUB_KEY      = os.getenv("FINNHUB_KEY",      "d6ubijpr01qp1k9busogd6ubijpr01
 GIFT_NIFTY_PROXY = os.getenv("GIFT_NIFTY_PROXY", "https://proxy-gift-nifty.onrender.com")
 CLAUDE_KEY       = os.getenv("CLAUDE_KEY",       "")
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY",  "")
+ADMIN_KEY        = os.getenv("ADMIN_KEY",        "")   # Set this in Render environment vars
 
-app = FastAPI(title="Bazaar Watch API v5.8")
+app = FastAPI(title="Bazaar Watch API v5.9")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1227,6 +1229,45 @@ def get_gift_bank_nifty(): return JSONResponse(cache["giftbanknifty"]["data"])
 @app.get("/api/summary")
 def get_summary():   return JSONResponse(cache["summary"]["data"])
 
+
+class SummaryPayload(BaseModel):
+    key:     str
+    text:    str
+    session: str = "manual"   # "manual" | "pre_market" | "hourly" | "post_market"
+
+@app.post("/api/admin/summary")
+def post_summary(payload: SummaryPayload):
+    """
+    Push a market summary from the admin panel.
+    Requires ADMIN_KEY environment variable to be set on Render.
+    """
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=503, detail="ADMIN_KEY not configured on server")
+    if payload.key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    if not payload.text or len(payload.text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Summary too short")
+
+    data = {
+        "summary":      payload.text.strip(),
+        "generated_at": datetime.now().isoformat(),
+        "session":      payload.session,
+        "source":       "manual",
+    }
+    cache["summary"] = {"data": data, "ts": time.time()}
+    log.info(f"✅ Manual summary pushed ({len(payload.text)} chars, session={payload.session})")
+    return {"ok": True, "chars": len(payload.text), "ts": data["generated_at"]}
+
+
+@app.delete("/api/admin/summary")
+def clear_summary(key: str):
+    """Clear the current summary."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    cache["summary"] = {"data": {}, "ts": 0}
+    log.info("Summary cleared")
+    return {"ok": True}
+
 @app.get("/api/heatmap")
 def get_heatmap():   return JSONResponse(cache["heatmap"]["data"])
 
@@ -1322,10 +1363,11 @@ def health():
     now = time.time()
     return {
         "status":      "ok",
-        "version":     "5.8",
+        "version":     "5.9",
         "finnhub_key": "set" if FINNHUB_KEY    else "missing",
         "claude_key":  "set" if CLAUDE_KEY     else "not configured",
         "scraper_key": "set" if SCRAPER_API_KEY else "missing",
+        "admin_key":   "set" if ADMIN_KEY      else "NOT SET — admin panel won't work",
         "gift_proxy":  GIFT_NIFTY_PROXY,
         "cache": {
             k: {
