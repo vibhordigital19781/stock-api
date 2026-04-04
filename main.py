@@ -12,12 +12,29 @@ Changes from v5.6:
 
 import os, time, asyncio, logging, threading
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import feedparser
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+# ── Optional heavyweight libs — imported lazily so startup never crashes ──────
+try:
+    import yfinance as yf
+    _HAS_YFINANCE = True
+except ImportError:
+    _HAS_YFINANCE = False
+
+try:
+    from nsepython import nse_optionchain_scrapper as _nse_scrapper
+    _HAS_NSEPYTHON = True
+except ImportError:
+    _HAS_NSEPYTHON = False
+
+# Thread pool for running sync library calls inside async functions
+_thread_pool = ThreadPoolExecutor(max_workers=4)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bazaar")
@@ -949,228 +966,44 @@ async def fetch_heatmap_stocks() -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  OPTION CHAIN — 4-source waterfall (no API key required for sources 1 & 2)
+#  OPTION CHAIN — 5-source waterfall
 #
-#  Source 1 — NSE Direct (3-step browser session)
-#    Mimics a real browser: homepage → option-chain page → API call.
-#    httpx automatically carries the Set-Cookie headers (nsit, nseappid) that
-#    NSE sets on the homepage response. No scraper service needed.
+#  WHY raw httpx alone fails:
+#   • NSE blocks many cloud server IP ranges (Render included).
+#     Their cookies (nsit, nseappid) are issued per-browser-session and expire.
+#   • Yahoo Finance v7 crumb exchange is blocked for the same server IPs.
+#   Raw httpx mimics a browser but can't beat IP-level blocking.
 #
-#  Source 2 — Yahoo Finance v6  (no crumb / no cookie required)
-#    The older v6 endpoint still works from server IPs without authentication.
+#  Solution — use purpose-built libraries first, fall back to raw calls:
 #
-#  Source 3 — Yahoo Finance v7  (crumb-based, existing logic kept)
-#    Works when Yahoo accepts the crumb exchange from Render's IP.
-#
-#  Source 4 — scrape.do session  (only when SCRAPER_API_KEY is set)
-#    Paid proxy service — best reliability but requires a key.
-#
-#  All sources feed into the same two processors (_process_nse_chain /
-#  _process_yahoo_chain) which return FULL strike lists (not just top-3).
+#  Source 1 — nsepython   (pip package; handles NSE session internally)
+#  Source 2 — yfinance    (pip package; handles Yahoo crumb/cookie internally)
+#  Source 3 — NSE Direct  (raw 3-step httpx session — works on un-blocked IPs)
+#  Source 4 — Yahoo raw   (manual crumb exchange — last httpx attempt)
+#  Source 5 — scrape.do   (paid proxy, only when SCRAPER_API_KEY is set)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Browser-like headers for NSE — must include a desktop UA and correct Accept
-_NSE_HTML_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection":      "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest":  "document",
-    "Sec-Fetch-Mode":  "navigate",
-    "Sec-Fetch-Site":  "none",
-}
-_NSE_API_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection":      "keep-alive",
-    "Referer":         "https://www.nseindia.com/option-chain",
-    "X-Requested-With":"XMLHttpRequest",
-    "Sec-Fetch-Dest":  "empty",
-    "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Site":  "same-origin",
-}
-
-# ── Source 1: NSE Direct — 3-step browser session ─────────────────────────────
-async def _fetch_nse_direct(client: httpx.AsyncClient, symbol: str):
-    """
-    Builds a real browser session without any paid scraper:
-      Step 1 — GET nseindia.com        → NSE sets 'nsit' + 'nseappid' cookies
-      Step 2 — GET /option-chain page  → NSE refreshes session cookies
-      Step 3 — GET the JSON API        → cookies carried automatically by httpx
-    Returns raw NSE JSON dict or None on failure.
-    """
-    try:
-        # Step 1 — homepage (sets the essential NSE session cookies)
-        r1 = await client.get(
-            "https://www.nseindia.com",
-            headers=_NSE_HTML_HEADERS,
-            timeout=15,
-        )
-        if r1.status_code != 200:
-            log.warning(f"NSE direct {symbol}: homepage HTTP {r1.status_code}")
-            return None
-        await asyncio.sleep(2)          # NSE rate-limits aggressive clients
-
-        # Step 2 — option-chain page (refreshes cookies, sets 'ak_bmsc')
-        await client.get(
-            "https://www.nseindia.com/option-chain",
-            headers={**_NSE_HTML_HEADERS, "Referer": "https://www.nseindia.com/"},
-            timeout=15,
-        )
-        await asyncio.sleep(1.5)
-
-        # Step 3 — actual JSON API (all cookies sent automatically)
-        r3 = await client.get(
-            f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
-            headers=_NSE_API_HEADERS,
-            timeout=20,
-        )
-        if r3.status_code != 200:
-            log.warning(f"NSE direct {symbol}: API HTTP {r3.status_code}")
-            return None
-        text = r3.text.strip()
-        if not text or text.startswith("<"):
-            log.warning(f"NSE direct {symbol}: non-JSON response (blocked?)")
-            return None
-        data = r3.json()
-        if isinstance(data, dict) and "records" in data and "data" in data.get("records", {}):
-            log.info(f"✅ NSE direct {symbol}: {len(data['records']['data'])} rows")
-            return data
-        log.warning(f"NSE direct {symbol}: unexpected structure")
-    except Exception as e:
-        log.warning(f"NSE direct {symbol}: {e}")
-    return None
-
-
-# ── Source 2: Yahoo Finance v6 — no crumb, no cookie needed ──────────────────
-async def _fetch_yahoo_options_v6(client: httpx.AsyncClient, symbol: str):
-    """
-    Yahoo's older v6 options endpoint does not require a crumb cookie.
-    Works reliably from server IPs where v7 is blocked.
-    """
-    for host in ["query1", "query2"]:
-        try:
-            r = await client.get(
-                f"https://{host}.finance.yahoo.com/v6/finance/options/{symbol}",
-                headers=YAHOO_HEADERS,
-                timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            d = r.json()
-            chain = (d.get("optionChain", {}).get("result", []) or [None])[0]
-            if chain and chain.get("options") and chain["options"][0].get("calls"):
-                log.info(f"✅ Yahoo v6 {symbol} ({host}): ok")
-                return chain
-        except Exception as e:
-            log.warning(f"Yahoo v6 {symbol} ({host}): {e}")
-    return None
-
-
-# ── Source 3: Yahoo Finance v7 with crumb (existing) ──────────────────────────
-_yahoo_crumb = {"crumb": None, "cookies": None, "ts": 0}
-
-async def _get_yahoo_crumb(client: httpx.AsyncClient):
-    now = time.time()
-    if _yahoo_crumb["crumb"] and (now - _yahoo_crumb["ts"]) < 1800:
-        return _yahoo_crumb["crumb"], _yahoo_crumb["cookies"]
-    cookies = None
-    for url in ["https://fc.yahoo.com", "https://query2.finance.yahoo.com"]:
-        try:
-            r = await client.get(url, timeout=8)
-            if r.cookies:
-                cookies = dict(r.cookies)
-                break
-        except: continue
-    if not cookies: return None, None
-    try:
-        r = await client.get("https://query2.finance.yahoo.com/v1/test/getcrumb",
-                             cookies=cookies, timeout=8)
-        if r.status_code == 200 and r.text.strip() and len(r.text.strip()) < 50:
-            crumb = r.text.strip()
-            _yahoo_crumb.update({"crumb": crumb, "cookies": cookies, "ts": now})
-            return crumb, cookies
-    except Exception as e:
-        log.warning(f"Yahoo crumb: {e}")
-    return None, None
-
-async def _fetch_yahoo_options_v7(client: httpx.AsyncClient, symbol: str):
-    crumb, cookies = await _get_yahoo_crumb(client)
-    if not crumb: return None
-    for attempt in range(2):
-        try:
-            host = "query2" if attempt == 0 else "query1"
-            r = await client.get(
-                f"https://{host}.finance.yahoo.com/v7/finance/options/{symbol}",
-                params={"crumb": crumb}, cookies=cookies, timeout=15,
-            )
-            if r.status_code != 200: continue
-            d = r.json()
-            chain = (d.get("optionChain", {}).get("result", []) or [None])[0]
-            if chain and chain.get("options") and chain["options"][0].get("calls"):
-                log.info(f"✅ Yahoo v7 crumb {symbol}: ok")
-                return chain
-        except Exception as e:
-            if attempt == 1: log.warning(f"Yahoo v7 {symbol}: {e}")
-    return None
-
-
-# ── Source 4: scrape.do session (only when SCRAPER_API_KEY is set) ─────────────
-async def _fetch_nse_via_scraper(client: httpx.AsyncClient, symbol: str):
-    if not SCRAPER_API_KEY:
-        return None
-    from urllib.parse import quote
-    import random, string
-    sid = "nse-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    try:
-        r1 = await client.get(
-            f"https://api.scrape.do?token={SCRAPER_API_KEY}"
-            f"&url={quote('https://www.nseindia.com/option-chain', safe='')}&sessionId={sid}",
-            timeout=30,
-        )
-        if r1.status_code != 200: return None
-        await asyncio.sleep(2)
-        r2 = await client.get(
-            f"https://api.scrape.do?token={SCRAPER_API_KEY}"
-            f"&url={quote(f'https://www.nseindia.com/api/option-chain-indices?symbol={symbol}', safe='')}&sessionId={sid}",
-            timeout=30,
-        )
-        if r2.status_code == 200:
-            data = r2.json()
-            if isinstance(data, dict) and "records" in data and "data" in data.get("records", {}):
-                log.info(f"✅ scrape.do {symbol}: ok")
-                return data
-    except Exception as e:
-        log.warning(f"scrape.do {symbol}: {e}")
-    return None
-
-
-# ── Chain processors — return FULL strike list (not top-3) ───────────────────
+# ── Shared processor: NSE-format JSON → our dict ─────────────────────────────
 def _process_nse_chain(raw):
-    """Parse raw NSE JSON → pcr, maxpain, full call_oi + put_oi lists."""
+    """Parse raw NSE /api/option-chain-indices response."""
     if not raw or "records" not in raw or "data" not in raw.get("records", {}):
         return None
     records = raw["records"]
-    data    = records["data"]
+    rows    = records["data"]
     expiry_dates = sorted(
-        set(r["expiryDate"] for r in data),
+        set(r["expiryDate"] for r in rows),
         key=lambda d: datetime.strptime(d, "%d-%b-%Y"),
     )
     if not expiry_dates: return None
     nearest = expiry_dates[0]
-    near    = [r for r in data if r["expiryDate"] == nearest]
-    total_ce, total_pe = 0, 0
+    near    = [r for r in rows if r["expiryDate"] == nearest]
+    total_ce = total_pe = 0
     calls, puts, strike_map = [], [], {}
     for row in near:
-        s      = row["strikePrice"]
-        ce_oi  = (row.get("CE", {}).get("openInterest", 0) or 0)
-        pe_oi  = (row.get("PE", {}).get("openInterest", 0) or 0)
-        total_ce += ce_oi
-        total_pe += pe_oi
+        s     = row["strikePrice"]
+        ce_oi = row.get("CE", {}).get("openInterest", 0) or 0
+        pe_oi = row.get("PE", {}).get("openInterest", 0) or 0
+        total_ce += ce_oi;  total_pe += pe_oi
         if ce_oi: calls.append({"strike": s, "oi": ce_oi})
         if pe_oi: puts.append({"strike": s, "oi": pe_oi})
         strike_map[s] = 0
@@ -1178,8 +1011,8 @@ def _process_nse_chain(raw):
         pain = 0
         for row in near:
             s     = row["strikePrice"]
-            ce_oi = (row.get("CE", {}).get("openInterest", 0) or 0)
-            pe_oi = (row.get("PE", {}).get("openInterest", 0) or 0)
+            ce_oi = row.get("CE", {}).get("openInterest", 0) or 0
+            pe_oi = row.get("PE", {}).get("openInterest", 0) or 0
             if test_s > s: pain += (test_s - s) * ce_oi
             if test_s < s: pain += (s - test_s) * pe_oi
         strike_map[test_s] = pain
@@ -1198,8 +1031,9 @@ def _process_nse_chain(raw):
     }
 
 
+# ── Shared processor: Yahoo-format chain → our dict ──────────────────────────
 def _process_yahoo_chain(chain):
-    """Parse raw Yahoo options chain → pcr, maxpain, full call_oi + put_oi lists."""
+    """Parse raw Yahoo optionChain result (from raw httpx or yfinance dicts)."""
     if not chain or not chain.get("options"): return None
     nearest   = chain["options"][0]
     calls_raw = nearest.get("calls", [])
@@ -1207,7 +1041,7 @@ def _process_yahoo_chain(chain):
     if not calls_raw and not puts_raw: return None
     exp_ts     = nearest.get("expirationDate", 0)
     expiry_str = datetime.utcfromtimestamp(exp_ts).strftime("%d-%b-%Y") if exp_ts else "—"
-    total_ce, total_pe = 0, 0
+    total_ce = total_pe = 0
     calls, puts, all_rows = [], [], {}
     for c in calls_raw:
         s, oi = c.get("strike", 0), c.get("openInterest", 0) or 0
@@ -1238,71 +1072,269 @@ def _process_yahoo_chain(chain):
     }
 
 
-# ── Master fetch — tries all 4 sources per symbol ────────────────────────────
+# ── Source 1: nsepython — handles NSE session internally ─────────────────────
+async def _src_nsepython(nse_symbol: str):
+    """
+    nsepython.nse_optionchain_scrapper() is a synchronous function that
+    builds its own requests.Session() with correct NSE cookies.
+    We run it in a thread so it doesn't block the event loop.
+    Returns processed dict or None.
+    """
+    if not _HAS_NSEPYTHON:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        def _sync():
+            return _nse_scrapper(nse_symbol)
+        raw = await loop.run_in_executor(_thread_pool, _sync)
+        result = _process_nse_chain(raw)
+        if result:
+            result["source"] = "nsepython"
+            log.info(f"✅ nsepython {nse_symbol}: {len(result['call_oi'])} call strikes")
+        return result
+    except Exception as e:
+        log.warning(f"nsepython {nse_symbol}: {e}")
+    return None
+
+
+# ── Source 2: yfinance — handles Yahoo crumb/cookie internally ───────────────
+async def _src_yfinance(yahoo_symbol: str):
+    """
+    yfinance.Ticker.option_chain() handles Yahoo Finance authentication
+    internally — it manages crumb and cookie exchange automatically.
+    Runs synchronously in a thread pool.
+    Returns processed dict or None.
+    """
+    if not _HAS_YFINANCE:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        def _sync():
+            ticker = yf.Ticker(yahoo_symbol)
+            dates  = ticker.options          # list of expiry date strings
+            if not dates:
+                return None
+            chain = ticker.option_chain(dates[0])   # nearest expiry
+            # yfinance returns namedtuple: chain.calls, chain.puts (DataFrames)
+            # Convert to Yahoo raw dict format that _process_yahoo_chain expects
+            calls_raw, puts_raw = [], []
+            for _, row in chain.calls.iterrows():
+                oi = int(row.get("openInterest", 0) or 0)
+                calls_raw.append({
+                    "strike":         float(row.get("strike", 0)),
+                    "openInterest":   oi,
+                    "expirationDate": 0,
+                })
+            for _, row in chain.puts.iterrows():
+                oi = int(row.get("openInterest", 0) or 0)
+                puts_raw.append({
+                    "strike":       float(row.get("strike", 0)),
+                    "openInterest": oi,
+                })
+            exp_str = dates[0]   # "YYYY-MM-DD" from yfinance
+            try:
+                exp_ts = int(datetime.strptime(exp_str, "%Y-%m-%d").timestamp())
+            except Exception:
+                exp_ts = 0
+            return {
+                "options": [{
+                    "calls":          calls_raw,
+                    "puts":           puts_raw,
+                    "expirationDate": exp_ts,
+                }],
+                "quote": {},
+            }
+        raw = await loop.run_in_executor(_thread_pool, _sync)
+        if raw is None:
+            return None
+        result = _process_yahoo_chain(raw)
+        if result:
+            result["source"] = "yfinance"
+            log.info(f"✅ yfinance {yahoo_symbol}: {len(result['call_oi'])} call strikes")
+        return result
+    except Exception as e:
+        log.warning(f"yfinance {yahoo_symbol}: {e}")
+    return None
+
+
+# ── Source 3: NSE Direct — raw 3-step browser session ────────────────────────
+_NSE_HTML_HDR = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+_NSE_API_HDR = {
+    "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Language":  "en-US,en;q=0.9",
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Referer":          "https://www.nseindia.com/option-chain",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+async def _src_nse_direct(client: httpx.AsyncClient, nse_symbol: str):
+    """
+    3-step browser session: homepage → /option-chain → JSON API.
+    httpx.AsyncClient carries Set-Cookie headers automatically.
+    Works on IPs that aren't blocked by NSE.
+    """
+    try:
+        r1 = await client.get("https://www.nseindia.com",
+                              headers=_NSE_HTML_HDR, timeout=15)
+        if r1.status_code != 200: return None
+        await asyncio.sleep(2)
+        await client.get("https://www.nseindia.com/option-chain",
+                         headers={**_NSE_HTML_HDR, "Referer": "https://www.nseindia.com/"},
+                         timeout=15)
+        await asyncio.sleep(1.5)
+        r3 = await client.get(
+            f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}",
+            headers=_NSE_API_HDR, timeout=20,
+        )
+        if r3.status_code != 200: return None
+        text = r3.text.strip()
+        if not text or text.startswith("<"): return None
+        raw    = r3.json()
+        result = _process_nse_chain(raw)
+        if result:
+            result["source"] = "nse_direct"
+            log.info(f"✅ NSE direct {nse_symbol}: {len(result['call_oi'])} strikes")
+        return result
+    except Exception as e:
+        log.warning(f"NSE direct {nse_symbol}: {e}")
+    return None
+
+
+# ── Source 4: Yahoo raw (manual crumb) ───────────────────────────────────────
+_yahoo_crumb = {"crumb": None, "cookies": None, "ts": 0}
+
+async def _src_yahoo_raw(client: httpx.AsyncClient, yahoo_symbol: str):
+    """Manual Yahoo crumb exchange — fallback when yfinance lib is unavailable."""
+    now = time.time()
+    if not (_yahoo_crumb["crumb"] and now - _yahoo_crumb["ts"] < 1800):
+        cookies = None
+        for url in ["https://fc.yahoo.com", "https://query2.finance.yahoo.com"]:
+            try:
+                r = await client.get(url, timeout=8)
+                if r.cookies: cookies = dict(r.cookies); break
+            except: continue
+        if cookies:
+            try:
+                r = await client.get("https://query2.finance.yahoo.com/v1/test/getcrumb",
+                                     cookies=cookies, timeout=8)
+                if r.status_code == 200 and r.text.strip():
+                    _yahoo_crumb.update({"crumb": r.text.strip(), "cookies": cookies, "ts": now})
+            except Exception as e:
+                log.warning(f"Yahoo crumb: {e}")
+    if not _yahoo_crumb["crumb"]: return None
+    for host in ["query2", "query1"]:
+        try:
+            r = await client.get(
+                f"https://{host}.finance.yahoo.com/v7/finance/options/{yahoo_symbol}",
+                params={"crumb": _yahoo_crumb["crumb"]},
+                cookies=_yahoo_crumb["cookies"],
+                timeout=15,
+            )
+            if r.status_code != 200: continue
+            d     = r.json()
+            chain = (d.get("optionChain", {}).get("result", []) or [None])[0]
+            if chain and chain.get("options") and chain["options"][0].get("calls"):
+                result = _process_yahoo_chain(chain)
+                if result:
+                    result["source"] = "yahoo_raw"
+                    log.info(f"✅ Yahoo raw {yahoo_symbol}: {len(result['call_oi'])} strikes")
+                return result
+        except Exception as e:
+            log.warning(f"Yahoo raw {yahoo_symbol} ({host}): {e}")
+    return None
+
+
+# ── Source 5: scrape.do (paid proxy, optional) ───────────────────────────────
+async def _src_scrapedo(client: httpx.AsyncClient, nse_symbol: str):
+    """scrape.do paid proxy — only fires when SCRAPER_API_KEY is set."""
+    if not SCRAPER_API_KEY: return None
+    from urllib.parse import quote
+    import random, string
+    sid = "nse-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    try:
+        r1 = await client.get(
+            f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+            f"&url={quote('https://www.nseindia.com/option-chain',safe='')}&sessionId={sid}",
+            timeout=30)
+        if r1.status_code != 200: return None
+        await asyncio.sleep(2)
+        r2 = await client.get(
+            f"https://api.scrape.do?token={SCRAPER_API_KEY}"
+            f"&url={quote(f'https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}',safe='')}&sessionId={sid}",
+            timeout=30)
+        if r2.status_code != 200: return None
+        raw    = r2.json()
+        result = _process_nse_chain(raw)
+        if result:
+            result["source"] = "scrapedo"
+            log.info(f"✅ scrape.do {nse_symbol}: {len(result['call_oi'])} strikes")
+        return result
+    except Exception as e:
+        log.warning(f"scrape.do {nse_symbol}: {e}")
+    return None
+
+
+# ── Master fetcher ─────────────────────────────────────────────────────────────
 async def fetch_option_chain():
     """
-    Fetches Nifty + BankNifty option chains using a 4-source waterfall.
-    Stops at the first source that returns valid data for each symbol.
-
-    Waterfall order:
-      1. NSE Direct (3-step browser session) — no API key needed
-      2. Yahoo Finance v6                    — no crumb needed
-      3. Yahoo Finance v7 (crumb)            — fallback
-      4. scrape.do                           — only if SCRAPER_API_KEY is set
+    Fetches Nifty + BankNifty option chains via 5-source waterfall.
+    Stops at the first source that returns valid data per symbol.
     """
     result    = {}
     nse_map   = {"nifty": "NIFTY",    "bn": "BANKNIFTY"}
     yahoo_map = {"nifty": "^NSEI",    "bn": "^NSEBANK"}
 
-    try:
-        # One shared client per call — NSE session cookies persist across steps
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            for prefix in ["nifty", "bn"]:
-                processed = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        for prefix in ["nifty", "bn"]:
+            processed = None
+            ns = nse_map[prefix]
+            ys = yahoo_map[prefix]
 
-                # ── 1. NSE Direct (no API key) ────────────────────────────────
-                raw = await _fetch_nse_direct(client, nse_map[prefix])
-                if raw:
-                    processed = _process_nse_chain(raw)
+            # 1 — nsepython (pip lib, handles NSE session internally)
+            if not processed:
+                processed = await _src_nsepython(ns)
 
-                # ── 2. Yahoo v6 (no crumb) ────────────────────────────────────
-                if not processed:
-                    chain = await _fetch_yahoo_options_v6(client, yahoo_map[prefix])
-                    if chain:
-                        processed = _process_yahoo_chain(chain)
+            # 2 — yfinance (pip lib, handles Yahoo session internally)
+            if not processed:
+                processed = await _src_yfinance(ys)
 
-                # ── 3. Yahoo v7 (crumb) ───────────────────────────────────────
-                if not processed:
-                    chain = await _fetch_yahoo_options_v7(client, yahoo_map[prefix])
-                    if chain:
-                        processed = _process_yahoo_chain(chain)
+            # 3 — NSE Direct (raw httpx 3-step, works on non-blocked IPs)
+            if not processed:
+                processed = await _src_nse_direct(client, ns)
 
-                # ── 4. scrape.do (paid, optional) ─────────────────────────────
-                if not processed:
-                    raw = await _fetch_nse_via_scraper(client, nse_map[prefix])
-                    if raw:
-                        processed = _process_nse_chain(raw)
+            # 4 — Yahoo raw crumb (httpx manual crumb exchange)
+            if not processed:
+                processed = await _src_yahoo_raw(client, ys)
 
-                if processed:
-                    result[f"{prefix}_pcr"]     = processed["pcr"]
-                    result[f"{prefix}_maxpain"]  = processed["maxpain"]
-                    result[f"{prefix}_expiry"]   = processed["expiry"]
-                    result[f"{prefix}_spot"]     = processed["spot"]
-                    result[f"{prefix}_call_oi"]  = processed["call_oi"]
-                    result[f"{prefix}_put_oi"]   = processed["put_oi"]
-                    result[f"{prefix}_total_ce"] = processed["total_ce"]
-                    result[f"{prefix}_total_pe"] = processed["total_pe"]
-                    result[f"{prefix}_source"]   = processed.get("source", "unknown")
-                    log.info(f"✅ {prefix}: data from '{processed.get('source')}' — {len(processed['call_oi'])} call strikes")
-                else:
-                    log.warning(f"⚠️ {prefix}: all 4 sources failed")
+            # 5 — scrape.do (paid proxy, only if key is set)
+            if not processed:
+                processed = await _src_scrapedo(client, ns)
 
-                await asyncio.sleep(2)   # be polite between symbols
+            if processed:
+                result[f"{prefix}_pcr"]     = processed["pcr"]
+                result[f"{prefix}_maxpain"]  = processed["maxpain"]
+                result[f"{prefix}_expiry"]   = processed["expiry"]
+                result[f"{prefix}_spot"]     = processed["spot"]
+                result[f"{prefix}_call_oi"]  = processed["call_oi"]
+                result[f"{prefix}_put_oi"]   = processed["put_oi"]
+                result[f"{prefix}_total_ce"] = processed["total_ce"]
+                result[f"{prefix}_total_pe"] = processed["total_pe"]
+                result[f"{prefix}_source"]   = processed["source"]
+            else:
+                log.warning(f"⚠️  {prefix}: all 5 sources failed")
 
-        if result:
-            result["updated_at"] = datetime.now().isoformat()
-    except Exception as e:
-        log.error(f"Option chain error: {e}")
+            await asyncio.sleep(2)
+
+    if result:
+        result["updated_at"] = datetime.now().isoformat()
     return result
 
 
@@ -1643,35 +1675,70 @@ async def debug_nse_news():
 
 @app.get("/api/debug-options")
 async def debug_options():
+    """Live test of all 5 option chain sources. Check this to diagnose failures."""
     from urllib.parse import quote
     import random, string
-    results = {}
+    results = {
+        "nsepython_available": _HAS_NSEPYTHON,
+        "yfinance_available":  _HAS_YFINANCE,
+        "scraper_key_set":     bool(SCRAPER_API_KEY),
+    }
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, follow_redirects=True, timeout=40) as client:
-        if SCRAPER_API_KEY:
-            sid = "dbg-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        # Test nsepython
+        if _HAS_NSEPYTHON:
             try:
+                loop = asyncio.get_event_loop()
+                raw = await loop.run_in_executor(_thread_pool, _nse_scrapper, "NIFTY")
+                results["nsepython_nifty"] = "ok" if (raw and "records" in raw) else "empty"
+            except Exception as e:
+                results["nsepython_nifty"] = str(e)
+
+        # Test yfinance
+        if _HAS_YFINANCE:
+            try:
+                loop = asyncio.get_event_loop()
+                def _yf_test():
+                    t = yf.Ticker("^NSEI")
+                    return t.options
+                dates = await loop.run_in_executor(_thread_pool, _yf_test)
+                results["yfinance_nifty_dates"] = list(dates[:3]) if dates else []
+            except Exception as e:
+                results["yfinance_nifty"] = str(e)
+
+        # Test NSE direct
+        try:
+            r1 = await client.get("https://www.nseindia.com", headers=_NSE_HTML_HDR, timeout=10)
+            results["nse_homepage_status"] = r1.status_code
+            results["nse_cookies_received"] = list(dict(r1.cookies).keys())
+        except Exception as e:
+            results["nse_homepage_error"] = str(e)
+
+        # Test Yahoo crumb
+        try:
+            crumb, cookies = None, None
+            for url in ["https://fc.yahoo.com", "https://query2.finance.yahoo.com"]:
+                r = await client.get(url, timeout=8)
+                if r.cookies: cookies = dict(r.cookies); break
+            if cookies:
+                r = await client.get("https://query2.finance.yahoo.com/v1/test/getcrumb",
+                                     cookies=cookies, timeout=8)
+                results["yahoo_crumb_status"] = r.status_code
+                results["yahoo_crumb_ok"] = r.status_code == 200 and bool(r.text.strip())
+        except Exception as e:
+            results["yahoo_crumb_error"] = str(e)
+
+        # Test scrape.do
+        if SCRAPER_API_KEY:
+            try:
+                sid = "dbg-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
                 r1 = await client.get(
                     f"https://api.scrape.do?token={SCRAPER_API_KEY}"
-                    f"&url={quote('https://www.nseindia.com/option-chain', safe='')}&sessionId={sid}",
-                    timeout=30
-                )
-                results["scraper_step1_status"] = r1.status_code
-                await asyncio.sleep(2)
-                r2 = await client.get(
-                    f"https://api.scrape.do?token={SCRAPER_API_KEY}"
-                    f"&url={quote('https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY', safe='')}&sessionId={sid}",
-                    timeout=30
-                )
-                results["scraper_step2_status"] = r2.status_code
-                results["scraper_step2_has_records"] = '"records"' in r2.text[:2000]
+                    f"&url={quote('https://www.nseindia.com/option-chain',safe='')}&sessionId={sid}",
+                    timeout=30)
+                results["scrapedo_step1"] = r1.status_code
             except Exception as e:
-                results["scraper_error"] = str(e)
-        try:
-            crumb, cookies = await _get_yahoo_crumb(client)
-            results["yahoo_crumb"] = crumb[:10] + "..." if crumb else None
-            results["yahoo_cookies"] = bool(cookies)
-        except Exception as e:
-            results["yahoo_error"] = str(e)
+                results["scrapedo_error"] = str(e)
+
     return JSONResponse(results)
 
 
