@@ -170,6 +170,7 @@ async def fetch_us_markets() -> dict:
         "^IXIC":    "nasdaq",
         "DX-Y.NYB": "dxy",
         "^VIX":     "vix_us",
+        "^TNX":     "us10y",     # US 10-Year Treasury Yield (Yahoo Finance)
     }
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=15, follow_redirects=True) as client:
         for sym, key in symbol_map.items():
