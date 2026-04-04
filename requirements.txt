@@ -1,6 +1,8 @@
-fastapi==0.110.0
-uvicorn==0.29.0
-httpx[http2]>=0.23.0,<0.24.0
-feedparser==6.0.11
-python-dotenv==1.0.0
+fastapi
+uvicorn[standard]
 httpx
+feedparser
+pydantic
+yfinance>=0.2.0
+nsepython
+pandas
