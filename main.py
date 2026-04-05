@@ -223,12 +223,16 @@ async def fetch_metals() -> dict:
 async def fetch_us_markets() -> dict:
     result = {}
     symbol_map = {
-        "^DJI":     "dow",
-        "^GSPC":    "sp500",
-        "^IXIC":    "nasdaq",
-        "DX-Y.NYB": "dxy",
-        "^VIX":     "vix_us",
-        "^TNX":     "us10y",     # US 10-Year Treasury Yield (Yahoo Finance)
+        "^DJI":       "dow",
+        "^GSPC":      "sp500",
+        "^IXIC":      "nasdaq",
+        "DX-Y.NYB":   "dxy",
+        "^VIX":       "vix_us",
+        "^TNX":       "us10y",      # US 10Y Treasury Yield
+        "^TYX":       "us30y",      # US 30Y Treasury Yield
+        "^FVX":       "us5y",       # US 5Y Treasury Yield
+        "^N225":      "nikkei",     # Nikkei 225 (Tokyo)
+        "^STOXX50E":  "stoxx50",    # EURO STOXX 50
     }
     async with httpx.AsyncClient(headers=YAHOO_HEADERS, timeout=15, follow_redirects=True) as client:
         for sym, key in symbol_map.items():
