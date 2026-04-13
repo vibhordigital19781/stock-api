@@ -1,0 +1,18 @@
+# Bazaar Watch — Backend Requirements
+# Python 3.11+
+
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# HTTP client (async)
+httpx==0.27.0
+
+# RSS / news feed parser
+feedparser==6.0.11
+
+# Data validation (used by FastAPI)
+pydantic==2.7.1
+
+# Starlette (FastAPI dependency — explicit pin for middleware stability)
+starlette==0.37.2
