@@ -1,0 +1,57 @@
+{
+  "name": "Bazaar Watch",
+  "short_name": "BazaarWatch",
+  "description": "Live Nifty 50, Bank Nifty, Gold, Crude Oil & global market data for Indian traders",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#060a0e",
+  "theme_color": "#FF9933",
+  "categories": ["finance", "business"],
+  "lang": "en-IN",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Gift Nifty",
+      "short_name": "Gift Nifty",
+      "url": "/gift-nifty",
+      "description": "Live Gift Nifty & Gift Bank Nifty",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Pre-Market Cues",
+      "short_name": "Pre-Market",
+      "url": "/pre-market-cues",
+      "description": "Morning market brief before NSE opens",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "F&O Heatmap",
+      "short_name": "Heatmap",
+      "url": "/fno-heatmap",
+      "description": "NSE F&O heatmap, PCR & option chain",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Gold Price",
+      "short_name": "Gold",
+      "url": "/gold-price",
+      "description": "Live gold & silver prices in INR and USD",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any" }]
+    }
+  ]
+}
