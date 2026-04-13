@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-httpx
-feedparser
-pydantic
-yfinance>=0.2.0
-nsepython
-pandas
